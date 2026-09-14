@@ -1,7 +1,7 @@
 name: swiftshare
 description: "SwiftShare - high-speed local file transfer between nearby devices."
 publish_to: 'none'
-version: 1.0.2+3
+version: 1.0.3+4
 environment:
   sdk: ^3.11.5
 dependencies:

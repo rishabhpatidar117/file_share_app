@@ -111,7 +111,10 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                       return _buildSearchingIndicator(isDark);
                     }
                     if (state.status == DiscoveryStatus.connecting) {
-                      return _buildConnectingIndicator(state.selectedDevice, isDark);
+                      return _buildConnectingIndicator(
+                        state.selectedDevice,
+                        isDark,
+                      );
                     }
                     if (state.status == DiscoveryStatus.error) {
                       return _buildErrorState(state.errorMessage, isDark);
@@ -242,21 +245,26 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
             final device = state.devices[index];
             return Padding(
               padding: const EdgeInsets.only(bottom: 12),
-              child: _DeviceCard(
-                device: device,
-                isDark: isDark,
-                onTap: () async {
-                  final connected = await _cubit.connectToDevice(device);
-                  if (!mounted || !connected) return;
-                  Navigator.push(
-                    this.context,
-                    MaterialPageRoute(
-                      builder: (_) => const FilePickerScreen(),
-                    ),
-                  );
-                },
-              ).animate().fadeIn(delay: Duration(milliseconds: 80 * index))
-                  .slideX(begin: 0.05),
+              child:
+                  _DeviceCard(
+                        device: device,
+                        isDark: isDark,
+                        onTap: () async {
+                          final connected = await _cubit.connectToDevice(
+                            device,
+                          );
+                          if (!mounted || !connected) return;
+                          Navigator.push(
+                            this.context,
+                            MaterialPageRoute(
+                              builder: (_) => const FilePickerScreen(),
+                            ),
+                          );
+                        },
+                      )
+                      .animate()
+                      .fadeIn(delay: Duration(milliseconds: 80 * index))
+                      .slideX(begin: 0.05),
             );
           },
         );
@@ -286,9 +294,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                     color: AppColors.success,
                     size: 44,
                   ),
-                )
-                    .animate(onPlay: (c) => c.repeat())
-                    .shimmer(duration: 1800.ms),
+                ).animate(onPlay: (c) => c.repeat()).shimmer(duration: 1800.ms),
                 const SizedBox(height: 20),
                 Text(
                   'Waiting for incoming files…',
@@ -303,7 +309,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                 const SizedBox(height: 24),
                 const Padding(
                   padding: EdgeInsets.symmetric(horizontal: 24),
-                  child: _MyInfoPanel(compact: true),
+                  child: _MyInfoPanel(compact: false),
                 ),
               ],
             ),
@@ -360,22 +366,22 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
             SliverToBoxAdapter(
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(24, 8, 24, 8),
-                child: Text('Files', style: AppTextStyles.heading3(isDark: isDark)),
+                child: Text(
+                  'Files',
+                  style: AppTextStyles.heading3(isDark: isDark),
+                ),
               ),
             ),
             SliverPadding(
               padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
               sliver: SliverList(
-                delegate: SliverChildBuilderDelegate(
-                  (context, index) {
-                    final file = incoming.files[index];
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: _IncomingFileCard(file: file, isDark: isDark),
-                    );
-                  },
-                  childCount: incoming.files.length,
-                ),
+                delegate: SliverChildBuilderDelegate((context, index) {
+                  final file = incoming.files[index];
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: _IncomingFileCard(file: file, isDark: isDark),
+                  );
+                }, childCount: incoming.files.length),
               ),
             ),
             if (incoming.status == SessionStatus.completed)
@@ -499,7 +505,9 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
             Expanded(
               child: Text(
                 message ?? 'An error occurred',
-                style: AppTextStyles.body(isDark: isDark).copyWith(color: AppColors.error),
+                style: AppTextStyles.body(
+                  isDark: isDark,
+                ).copyWith(color: AppColors.error),
               ),
             ),
           ],
@@ -517,14 +525,17 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
           Icon(
             Icons.devices_other,
             size: 64,
-            color: (isDark ? AppColors.darkTextSecondary : AppColors.textSecondary)
-                .withValues(alpha: 0.3),
+            color:
+                (isDark ? AppColors.darkTextSecondary : AppColors.textSecondary)
+                    .withValues(alpha: 0.3),
           ),
           const SizedBox(height: 16),
           Text(
             'No devices found nearby',
             style: AppTextStyles.body(isDark: isDark).copyWith(
-              color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+              color: isDark
+                  ? AppColors.darkTextSecondary
+                  : AppColors.textSecondary,
             ),
           ),
           const SizedBox(height: 8),
@@ -597,7 +608,11 @@ class _IncomingFileCard extends StatelessWidget {
                 ),
               ),
               if (file.status == FileTransferStatus.completed)
-                const Icon(Icons.check_circle, color: AppColors.success, size: 20),
+                const Icon(
+                  Icons.check_circle,
+                  color: AppColors.success,
+                  size: 20,
+                ),
             ],
           ),
           if (file.status == FileTransferStatus.transferring ||
@@ -722,7 +737,9 @@ class _DeviceCard extends StatelessWidget {
               Icon(
                 Icons.arrow_forward_ios,
                 size: 14,
-                color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+                color: isDark
+                    ? AppColors.darkTextSecondary
+                    : AppColors.textSecondary,
               ),
             ],
           ),
@@ -816,8 +833,9 @@ class _MyInfoPanelState extends State<_MyInfoPanel> {
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    final deviceName =
-        context.select<SettingsCubit, String>((c) => c.state.deviceName);
+    final deviceName = context.select<SettingsCubit, String>(
+      (c) => c.state.deviceName,
+    );
 
     return GlassCard(
       padding: EdgeInsets.all(widget.compact ? 14 : 18),
@@ -825,10 +843,7 @@ class _MyInfoPanelState extends State<_MyInfoPanel> {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Text(
-            'This device',
-            style: AppTextStyles.bodySmall(isDark: isDark),
-          ),
+          Text('This device', style: AppTextStyles.bodySmall(isDark: isDark)),
           Text(
             deviceName,
             style: AppTextStyles.body(isDark: isDark),
@@ -855,22 +870,30 @@ class _MyInfoPanelState extends State<_MyInfoPanel> {
                       onTap: () => _copy(ip),
                       borderRadius: BorderRadius.circular(8),
                       child: Container(
-                        padding:
-                            const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 6,
+                        ),
                         decoration: BoxDecoration(
-                          color:
-                              AppColors.primary.withValues(alpha: isDark ? 0.18 : 0.08),
+                          color: AppColors.primary.withValues(
+                            alpha: isDark ? 0.18 : 0.08,
+                          ),
                           borderRadius: BorderRadius.circular(8),
                         ),
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            Icon(Icons.copy, size: 14, color: AppColors.primary),
+                            Icon(
+                              Icons.copy,
+                              size: 14,
+                              color: AppColors.primary,
+                            ),
                             const SizedBox(width: 4),
                             Text(
                               '$ip : $kSwiftShareServicePort',
-                              style: AppTextStyles.bodySmall(isDark: isDark)
-                                  .copyWith(color: AppColors.primary),
+                              style: AppTextStyles.bodySmall(
+                                isDark: isDark,
+                              ).copyWith(color: AppColors.primary),
                             ),
                           ],
                         ),
