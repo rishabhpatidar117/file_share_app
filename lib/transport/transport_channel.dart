@@ -21,6 +21,83 @@ class TransportException implements Exception {
   String toString() => 'TransportException: $message${cause != null ? ' ($cause)' : ''}';
 }
 
+/// Metadata for one file offered by a remote device.
+class SessionFileMeta {
+  final int index;
+  final String fileName;
+  final int fileSize;
+  final int totalChunks;
+  final int receivedChunks;
+  final String? sha256;
+
+  const SessionFileMeta({
+    required this.index,
+    required this.fileName,
+    required this.fileSize,
+    required this.totalChunks,
+    this.receivedChunks = 0,
+    this.sha256,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'index': index,
+    'fileName': fileName,
+    'fileSize': fileSize,
+    'totalChunks': totalChunks,
+    'receivedChunks': receivedChunks,
+    'sha256': sha256,
+  };
+
+  factory SessionFileMeta.fromJson(Map<String, dynamic> json) => SessionFileMeta(
+    index: json['index'] as int,
+    fileName: json['fileName'] as String,
+    fileSize: json['fileSize'] as int,
+    totalChunks: json['totalChunks'] as int,
+    receivedChunks: json['receivedChunks'] as int? ?? 0,
+    sha256: json['sha256'] as String?,
+  );
+}
+
+/// A remote device wants to send us files.
+class IncomingSession {
+  final String sessionId;
+  final String remoteDeviceName;
+  final List<SessionFileMeta> files;
+  final int chunkSize;
+
+  const IncomingSession({
+    required this.sessionId,
+    required this.remoteDeviceName,
+    required this.files,
+    this.chunkSize = 512 * 1024,
+  });
+
+  int get totalBytes => files.fold(0, (sum, f) => sum + f.fileSize);
+}
+
+/// A remote sender finished transferring one file; receiver must verify the
+/// SHA-256 and ack (or request a resend of the whole file).
+class IncomingFileComplete {
+  final String sessionId;
+  final int fileIndex;
+  final String fileName;
+  final int fileSize;
+  final int totalChunks;
+  final String sha256;
+
+  const IncomingFileComplete({
+    required this.sessionId,
+    required this.fileIndex,
+    required this.fileName,
+    required this.fileSize,
+    required this.totalChunks,
+    required this.sha256,
+  });
+}
+
+/// Resume negotiation result: fileIndex -> number of chunks already received.
+typedef ResumePoints = Map<int, int>;
+
 abstract class TransportChannel {
   @protected
   final StreamController<DeviceInfo> deviceFoundController =
@@ -34,11 +111,25 @@ abstract class TransportChannel {
   @protected
   final StreamController<TransferProgress> progressController =
       StreamController<TransferProgress>.broadcast();
+  @protected
+  final StreamController<IncomingSession> incomingSessionController =
+      StreamController<IncomingSession>.broadcast();
+  @protected
+  final StreamController<IncomingFileComplete> incomingFileCompleteController =
+      StreamController<IncomingFileComplete>.broadcast();
+  @protected
+  final StreamController<void> incomingSessionCompleteController =
+      StreamController<void>.broadcast();
 
   Stream<DeviceInfo> get onDeviceFound => deviceFoundController.stream;
   Stream<TransportState> get onStateChanged => stateController.stream;
   Stream<ChunkReceivedEvent> get onChunkReceived => chunkReceivedController.stream;
   Stream<TransferProgress> get onProgress => progressController.stream;
+  Stream<IncomingSession> get onIncomingSession => incomingSessionController.stream;
+  Stream<IncomingFileComplete> get onIncomingFileComplete =>
+      incomingFileCompleteController.stream;
+  Stream<void> get onIncomingSessionComplete =>
+      incomingSessionCompleteController.stream;
 
   TransportState _state = TransportState.disconnected;
   TransportState get state => _state;
@@ -52,13 +143,61 @@ abstract class TransportChannel {
   /// Configures the device name announced during discovery.
   void setDeviceName(String name) {}
 
+  // ---- Sender (outgoing) side ----
+
   Future<void> startDiscovery({Duration timeout = const Duration(seconds: 15)});
   Future<void> stopDiscovery();
   Future<void> connectToDevice(DeviceInfo device);
+
+  /// Declare an outgoing transfer session. Resolves once the receiver
+  /// acknowledges with its resume points.
+  Future<ResumePoints> sendSessionStart(
+    String sessionId,
+    String deviceName,
+    List<SessionFileMeta> files, {
+    int? chunkSize,
+  });
+
+  /// Send one chunk; completes when the receiver acknowledges it.
+  /// Throws [TransportException] if the receiver rejected the chunk, in which
+  /// case the sender should retry the same chunk.
+  Future<void> sendChunk(int fileIndex, ChunkMetadata metadata, Uint8List data);
+
+  /// Send a file-complete marker; resolves when the receiver confirms the
+  /// whole file (SHA-256) matches.
+  Future<void> sendFileComplete(
+    int fileIndex,
+    String fileHash, {
+    String fileName = '',
+    int fileSize = 0,
+    int totalChunks = 0,
+  });
+
+  /// Notify the receiver that all files have been sent and verified.
+  Future<void> sendSessionComplete(String sessionId);
+
   Future<void> disconnect();
 
-  Future<void> sendChunk(int fileIndex, ChunkMetadata metadata, Uint8List data);
-  Future<void> sendFileComplete(int fileIndex, String fileHash);
+  // ---- Receiver (incoming) side ----
+
+  /// Start listening for incoming transfer requests.
+  Future<void> startIncoming();
+  Future<void> stopIncoming();
+
+  /// Accept an incoming session, telling the sender where to resume from.
+  Future<void> acceptIncoming(String sessionId, ResumePoints resumePoints);
+
+  /// Confirm a received chunk (CRC ok) so the sender continues.
+  Future<void> sendChunkAck(int fileIndex, int chunkIndex);
+
+  /// Report a bad chunk so the sender retransmits it.
+  Future<void> sendChunkError(int fileIndex, int chunkIndex);
+
+  /// Confirm the whole file verified (SHA-256) so the sender moves on.
+  Future<void> sendFileCompleteAck(int fileIndex);
+
+  /// Request the sender retransmit every chunk of a corrupt file.
+  Future<void> sendFileRetry(int fileIndex);
 
   void pause();
   void resume();
@@ -68,6 +207,9 @@ abstract class TransportChannel {
     stateController.close();
     chunkReceivedController.close();
     progressController.close();
+    incomingSessionController.close();
+    incomingFileCompleteController.close();
+    incomingSessionCompleteController.close();
   }
 }
 

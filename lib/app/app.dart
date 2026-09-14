@@ -6,6 +6,7 @@ import '../features/home/home_screen.dart';
 import '../features/discovery/discovery_cubit.dart';
 import '../features/transfer/transfer_cubit.dart';
 import '../features/settings/settings_cubit.dart';
+import '../features/history/history_cubit.dart';
 
 class SwiftShareApp extends StatelessWidget {
   const SwiftShareApp({super.key});
@@ -17,6 +18,7 @@ class SwiftShareApp extends StatelessWidget {
         BlocProvider(create: (_) => getIt<DiscoveryCubit>()),
         BlocProvider(create: (_) => getIt<TransferCubit>()),
         BlocProvider(create: (_) => getIt<SettingsCubit>()),
+        BlocProvider(create: (_) => getIt<HistoryCubit>()),
       ],
       child: BlocBuilder<SettingsCubit, SettingsState>(
         builder: (context, settingsState) {

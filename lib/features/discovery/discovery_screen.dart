@@ -5,9 +5,14 @@ import 'discovery_cubit.dart';
 import 'discovery_state.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text_styles.dart';
+import '../../core/utils/byte_formatter.dart';
 import '../../core/widgets/glass_card.dart';
+import '../../core/widgets/glass_toast.dart';
 import '../../core/widgets/gradient_background.dart';
 import '../../transport/device_info.dart';
+import '../transfer/transfer_cubit.dart';
+import '../transfer/transfer_state.dart';
+import '../transfer/session/transfer_session.dart';
 import '../file_picker/file_picker_screen.dart';
 
 class DiscoveryScreen extends StatefulWidget {
@@ -23,12 +28,20 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
   @override
   void initState() {
     super.initState();
-    context.read<DiscoveryCubit>().startDiscovery();
+    if (widget.isSender) {
+      context.read<DiscoveryCubit>().startDiscovery();
+    } else {
+      context.read<DiscoveryCubit>().startReceive();
+    }
   }
 
   @override
   void dispose() {
-    context.read<DiscoveryCubit>().stopDiscovery();
+    if (widget.isSender) {
+      context.read<DiscoveryCubit>().stopDiscovery();
+    } else {
+      context.read<DiscoveryCubit>().stopListening();
+    }
     super.dispose();
   }
 
@@ -47,14 +60,18 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                   children: [
                     IconButton(
                       onPressed: () {
-                        context.read<DiscoveryCubit>().stopDiscovery();
+                        if (widget.isSender) {
+                          context.read<DiscoveryCubit>().stopDiscovery();
+                        } else {
+                          context.read<DiscoveryCubit>().stopListening();
+                        }
                         Navigator.pop(context);
                       },
                       icon: const Icon(Icons.arrow_back_ios_new),
                     ),
                     Expanded(
                       child: Text(
-                        widget.isSender ? 'Select Device' : 'Waiting for Connection',
+                        widget.isSender ? 'Select Device' : 'Receive Files',
                         style: AppTextStyles.heading2(isDark: isDark),
                         textAlign: TextAlign.center,
                       ),
@@ -64,57 +81,237 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                 ),
               ),
               const SizedBox(height: 8),
-              BlocBuilder<DiscoveryCubit, DiscoveryState>(
-                builder: (context, state) {
-                  if (state.status == DiscoveryStatus.searching) {
-                    return _buildSearchingIndicator(isDark);
-                  }
-                  if (state.status == DiscoveryStatus.connecting) {
-                    return _buildConnectingIndicator(state.selectedDevice, isDark);
-                  }
-                  if (state.status == DiscoveryStatus.error) {
-                    return _buildErrorState(state.errorMessage, isDark);
-                  }
-                  return const SizedBox.shrink();
-                },
-              ),
-              Expanded(
-                child: BlocBuilder<DiscoveryCubit, DiscoveryState>(
+              if (widget.isSender)
+                BlocBuilder<DiscoveryCubit, DiscoveryState>(
                   builder: (context, state) {
-                    if (state.devices.isEmpty) {
-                      return _buildEmptyState(isDark);
+                    if (state.status == DiscoveryStatus.searching) {
+                      return _buildSearchingIndicator(isDark);
                     }
-                    return ListView.builder(
-                      padding: const EdgeInsets.all(24),
-                      itemCount: state.devices.length,
-                      itemBuilder: (context, index) {
-                        final device = state.devices[index];
-                        return Padding(
-                          padding: const EdgeInsets.only(bottom: 12),
-                          child: _DeviceCard(
-                            device: device,
-                            isDark: isDark,
-                            onTap: () {
-                              context.read<DiscoveryCubit>().connectToDevice(device);
-                              if (widget.isSender) {
-                                Navigator.push(
-                                  context,
-                                  MaterialPageRoute(
-                                    builder: (_) => const FilePickerScreen(),
-                                  ),
-                                );
-                              }
-                            },
-                          ).animate().fadeIn(delay: Duration(milliseconds: 80 * index))
-                              .slideX(begin: 0.05),
-                        );
-                      },
-                    );
+                    if (state.status == DiscoveryStatus.connecting) {
+                      return _buildConnectingIndicator(state.selectedDevice, isDark);
+                    }
+                    if (state.status == DiscoveryStatus.error) {
+                      return _buildErrorState(state.errorMessage, isDark);
+                    }
+                    return const SizedBox.shrink();
+                  },
+                )
+              else
+                BlocBuilder<DiscoveryCubit, DiscoveryState>(
+                  builder: (context, state) {
+                    if (state.status == DiscoveryStatus.error) {
+                      return _buildErrorState(state.errorMessage, isDark);
+                    }
+                    return _buildListeningIndicator(isDark);
                   },
                 ),
+              Expanded(
+                child: widget.isSender
+                    ? _buildDeviceList(isDark)
+                    : _buildReceiveMode(isDark),
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeviceList(bool isDark) {
+    return BlocBuilder<DiscoveryCubit, DiscoveryState>(
+      builder: (context, state) {
+        if (state.devices.isEmpty) {
+          return _buildEmptyState(isDark);
+        }
+        return ListView.builder(
+          padding: const EdgeInsets.all(24),
+          itemCount: state.devices.length,
+          itemBuilder: (context, index) {
+            final device = state.devices[index];
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: _DeviceCard(
+                device: device,
+                isDark: isDark,
+                onTap: () {
+                  context.read<DiscoveryCubit>().connectToDevice(device);
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => const FilePickerScreen(),
+                    ),
+                  );
+                },
+              ).animate().fadeIn(delay: Duration(milliseconds: 80 * index))
+                  .slideX(begin: 0.05),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildReceiveMode(bool isDark) {
+    return BlocBuilder<TransferCubit, TransferState>(
+      builder: (context, state) {
+        final incoming = state.incomingSession;
+
+        if (incoming == null) {
+          return Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  width: 84,
+                  height: 84,
+                  decoration: BoxDecoration(
+                    color: AppColors.success.withValues(alpha: 0.12),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(
+                    Icons.swap_vert_circle_outlined,
+                    color: AppColors.success,
+                    size: 44,
+                  ),
+                )
+                    .animate(onPlay: (c) => c.repeat())
+                    .shimmer(duration: 1800.ms),
+                const SizedBox(height: 20),
+                Text(
+                  'Waiting for incoming files…',
+                  style: AppTextStyles.heading3(isDark: isDark),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'The sender will see this device appear automatically.',
+                  style: AppTextStyles.bodySmall(isDark: isDark),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ),
+          );
+        }
+
+        return CustomScrollView(
+          slivers: [
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(24, 8, 24, 8),
+                child: GlassCard(
+                  padding: const EdgeInsets.all(16),
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 44,
+                        height: 44,
+                        decoration: BoxDecoration(
+                          color: AppColors.primary.withValues(alpha: 0.1),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: const Icon(
+                          Icons.download_rounded,
+                          color: AppColors.primary,
+                          size: 22,
+                        ),
+                      ),
+                      const SizedBox(width: 14),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Receiving from ${incoming.remoteDeviceName ?? "peer"}',
+                              style: AppTextStyles.body(isDark: isDark),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              '${incoming.files.length} file(s) • '
+                              '${ByteFormatter.format(incoming.totalBytes)}'
+                              '${state.incomingError != null ? ' • ${state.incomingError!}' : ''}',
+                              style: AppTextStyles.bodySmall(isDark: isDark),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(24, 8, 24, 8),
+                child: Text('Files', style: AppTextStyles.heading3(isDark: isDark)),
+              ),
+            ),
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+              sliver: SliverList(
+                delegate: SliverChildBuilderDelegate(
+                  (context, index) {
+                    final file = incoming.files[index];
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: _IncomingFileCard(file: file, isDark: isDark),
+                    );
+                  },
+                  childCount: incoming.files.length,
+                ),
+              ),
+            ),
+            if (incoming.status == SessionStatus.completed)
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+                  child: ElevatedButton.icon(
+                    onPressed: () {
+                      GlassToast.show(
+                        context,
+                        'Saved to ${state.saveDirectory ?? "Downloads"}',
+                      );
+                    },
+                    icon: const Icon(Icons.folder_open, size: 20),
+                    label: const Text('View save location'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppColors.success,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildListeningIndicator(bool isDark) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 4),
+      child: GlassCard(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+        child: Row(
+          children: [
+            Container(
+              width: 10,
+              height: 10,
+              decoration: BoxDecoration(
+                color: AppColors.success,
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Text(
+                'Listening for incoming transfers…',
+                style: AppTextStyles.body(isDark: isDark),
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -220,6 +417,118 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
         ],
       ),
     );
+  }
+}
+
+class _IncomingFileCard extends StatelessWidget {
+  final TransferFileManifest file;
+  final bool isDark;
+
+  const _IncomingFileCard({required this.file, required this.isDark});
+
+  @override
+  Widget build(BuildContext context) {
+    final color = _color;
+
+    return GlassCard(
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Icon(_icon, color: color, size: 18),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      file.fileName,
+                      style: AppTextStyles.body(isDark: isDark),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    Text(
+                      '${ByteFormatter.format(file.fileSize)} • $_label',
+                      style: AppTextStyles.bodySmall(isDark: isDark),
+                    ),
+                  ],
+                ),
+              ),
+              if (file.status == FileTransferStatus.completed)
+                const Icon(Icons.check_circle, color: AppColors.success, size: 20),
+            ],
+          ),
+          if (file.status == FileTransferStatus.transferring ||
+              file.status == FileTransferStatus.paused)
+            Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  value: file.progress,
+                  backgroundColor: AppColors.primary.withValues(alpha: 0.1),
+                  valueColor: AlwaysStoppedAnimation<Color>(color),
+                  minHeight: 4,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Color get _color {
+    switch (file.status) {
+      case FileTransferStatus.completed:
+        return AppColors.success;
+      case FileTransferStatus.failed:
+        return AppColors.error;
+      case FileTransferStatus.transferring:
+        return AppColors.primary;
+      case FileTransferStatus.paused:
+        return AppColors.warning;
+      case FileTransferStatus.pending:
+        return Colors.grey;
+    }
+  }
+
+  IconData get _icon {
+    switch (file.status) {
+      case FileTransferStatus.completed:
+        return Icons.check_circle_outline;
+      case FileTransferStatus.failed:
+        return Icons.error_outline;
+      case FileTransferStatus.transferring:
+        return Icons.sync;
+      case FileTransferStatus.paused:
+        return Icons.pause_circle_outline;
+      case FileTransferStatus.pending:
+        return Icons.schedule;
+    }
+  }
+
+  String get _label {
+    switch (file.status) {
+      case FileTransferStatus.completed:
+        return 'Saved';
+      case FileTransferStatus.failed:
+        return 'Failed - resending';
+      case FileTransferStatus.transferring:
+        return '${(file.progress * 100).toInt()}%';
+      case FileTransferStatus.paused:
+        return 'Paused';
+      case FileTransferStatus.pending:
+        return 'Waiting';
+    }
   }
 }
 

@@ -1,12 +1,19 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text_styles.dart';
+import '../../core/utils/byte_formatter.dart';
 import '../../core/widgets/glass_card.dart';
+import '../../core/widgets/glass_toast.dart';
 import '../../core/widgets/gradient_background.dart';
 import '../discovery/discovery_screen.dart';
+import '../history/history_cubit.dart';
 import '../history/history_screen.dart';
 import '../settings/settings_screen.dart';
+import '../transfer/session/transfer_session.dart';
+import '../transfer/transfer_cubit.dart';
+import '../transfer/transfer_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -132,33 +139,39 @@ class _HomeContent extends StatelessWidget {
   Widget build(BuildContext context) {
     return GradientBackground(
       child: SafeArea(
-        child: CustomScrollView(
-          slivers: [
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text('SwiftShare', style: AppTextStyles.heading1(isDark: isDark)),
-                    IconButton(
-                      onPressed: () {},
-                      icon: Icon(
-                        Icons.settings_outlined,
-                        color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
-                      ),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text('SwiftShare', style: AppTextStyles.heading1(isDark: isDark)),
+                  IconButton(
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const SettingsScreen(),
+                        ),
+                      );
+                    },
+                    icon: Icon(
+                      Icons.settings_outlined,
+                      color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
                     ),
-                  ],
-                ),
+                  ),
+                ],
               ),
-            ),
-            SliverPadding(
-              padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
-              sliver: SliverGrid.count(
+              const SizedBox(height: 12),
+              GridView.count(
                 crossAxisCount: MediaQuery.of(context).size.width > 600 ? 2 : 1,
                 childAspectRatio: 1.8,
                 mainAxisSpacing: 16,
                 crossAxisSpacing: 16,
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
                 children: [
                   _ActionCard(
                     title: 'Send Files',
@@ -190,74 +203,211 @@ class _HomeContent extends StatelessWidget {
                   ),
                 ].animate(interval: 100.ms).fadeIn().slideY(begin: 0.1),
               ),
-            ),
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(24, 8, 24, 4),
-                child: Text(
-                  'Recent Transfers',
-                  style: AppTextStyles.heading3(isDark: isDark),
-                ),
-              ),
-            ),
-            SliverPadding(
-              padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
-              sliver: SliverList(
-                delegate: SliverChildBuilderDelegate(
-                  (context, index) => Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: GlassCard(
-                      padding: const EdgeInsets.all(16),
-                      child: Row(
-                        children: [
-                          Container(
-                            width: 44,
-                            height: 44,
-                            decoration: BoxDecoration(
-                              color: AppColors.primary.withValues(alpha: 0.1),
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: const Icon(
-                              Icons.description_outlined,
-                              color: AppColors.primary,
-                              size: 22,
-                            ),
-                          ),
-                          const SizedBox(width: 14),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  'document_${index + 1}.pdf',
-                                  style: AppTextStyles.body(isDark: isDark),
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  '2.4 MB • Completed',
-                                  style: AppTextStyles.bodySmall(isDark: isDark),
-                                ),
-                              ],
-                            ),
-                          ),
-                          Icon(
-                            Icons.check_circle,
-                            color: AppColors.success,
-                            size: 20,
-                          ),
-                        ],
-                      ),
-                    ).animate().fadeIn(delay: Duration(milliseconds: 100 * index)),
-                  ),
-                  childCount: 3,
-                ),
-              ),
-            ),
-          ],
+              const SizedBox(height: 24),
+              Text('Recent Transfers', style: AppTextStyles.heading3(isDark: isDark)),
+              const SizedBox(height: 12),
+              const _RecentTransfers(),
+            ],
+          ),
         ),
       ),
     );
+  }
+}
+
+class _RecentTransfers extends StatefulWidget {
+  const _RecentTransfers();
+
+  @override
+  State<_RecentTransfers> createState() => _RecentTransfersState();
+}
+
+class _RecentTransfersState extends State<_RecentTransfers> {
+  @override
+  void initState() {
+    super.initState();
+    context.read<HistoryCubit>().loadHistory();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return BlocBuilder<HistoryCubit, HistoryState>(
+      builder: (context, state) {
+        if (state.isLoading) {
+          return const Padding(
+            padding: EdgeInsets.symmetric(vertical: 24),
+            child: Center(
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: AppColors.primary,
+              ),
+            ),
+          );
+        }
+
+        if (state.sessions.isEmpty) {
+          return GlassCard(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.history_toggle_off,
+                  color: (isDark ? AppColors.darkTextSecondary : AppColors.textSecondary)
+                      .withValues(alpha: 0.5),
+                  size: 22,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    'Transfers you send or receive will show up here.',
+                    style: AppTextStyles.bodySmall(isDark: isDark),
+                  ),
+                ),
+              ],
+            ),
+          );
+        }
+
+        final recents = state.sessions.take(3).toList();
+        return Column(
+          children: recents.map((session) {
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: _RecentCard(
+                session: session,
+                isDark: isDark,
+                onTap: () => _open(context, session),
+              ),
+            );
+          }).toList(),
+        );
+      },
+    );
+  }
+
+  void _open(BuildContext context, TransferSession session) {
+    final completed = session.status == SessionStatus.completed && session.isCompleted;
+    if (session.isSender && !completed) {
+      context.read<TransferCubit>().resumeSession(session.id);
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => const TransferScreen()),
+      );
+    } else if (completed) {
+      GlassToast.show(
+        context,
+        ' $session.isSender ? "Sent" : "Received" ${session.files.length} file(s).',
+      );
+    } else {
+      GlassToast.show(
+        context,
+        'Open "Receive Files" on the home screen to resume this transfer.',
+      );
+    }
+  }
+}
+
+class _RecentCard extends StatelessWidget {
+  final TransferSession session;
+  final bool isDark;
+  final VoidCallback onTap;
+
+  const _RecentCard({
+    required this.session,
+    required this.isDark,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final completed = session.isCompleted;
+    final name = session.files.isNotEmpty
+        ? session.files.first.fileName
+        : 'Untitled transfer';
+
+    return GlassCard(
+      padding: const EdgeInsets.all(16),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(24),
+          child: Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: _statusColor.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(_statusIcon, color: _statusColor, size: 22),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      name,
+                      style: AppTextStyles.body(isDark: isDark),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '${ByteFormatter.format(session.totalBytes)} • $_statusLabel'
+                      '${session.files.length > 1 ? ' • ${session.files.length} files' : ''}',
+                      style: AppTextStyles.bodySmall(isDark: isDark),
+                    ),
+                  ],
+                ),
+              ),
+              if (completed)
+                Icon(Icons.check_circle, color: AppColors.success, size: 20)
+              else if (session.isSender)
+                Icon(Icons.play_circle_outline, color: AppColors.success, size: 20),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Color get _statusColor {
+    if (session.isCompleted) return AppColors.success;
+    if (session.hasFailed) return AppColors.error;
+    if (session.status == SessionStatus.paused) return AppColors.warning;
+    return AppColors.primary;
+  }
+
+  IconData get _statusIcon {
+    if (session.isCompleted) return Icons.check_circle_outline;
+    if (session.hasFailed) return Icons.error_outline;
+    if (session.status == SessionStatus.paused) return Icons.pause_circle_outline;
+    return Icons.sync;
+  }
+
+  String get _statusLabel {
+    if (session.isCompleted) return 'Completed';
+    switch (session.status) {
+      case SessionStatus.transferring:
+        return 'In progress';
+      case SessionStatus.paused:
+        return 'Paused';
+      case SessionStatus.failed:
+        return 'Failed';
+      case SessionStatus.completed:
+        return 'Completed';
+      case SessionStatus.discovering:
+      case SessionStatus.connecting:
+        return 'Connecting';
+      case SessionStatus.created:
+        return 'Created';
+      case SessionStatus.resumed:
+        return 'In progress';
+    }
   }
 }
 

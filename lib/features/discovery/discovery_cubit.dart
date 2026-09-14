@@ -64,6 +64,32 @@ class DiscoveryCubit extends Cubit<DiscoveryState> {
     await _transport.stopDiscovery();
   }
 
+  /// Bind a listener so remote devices can start an incoming transfer.
+  Future<void> startReceive() async {
+    emit(state.copyWith(
+      status: DiscoveryStatus.searching,
+      devices: [],
+      clearError: true,
+    ));
+    try {
+      await _transport.startIncoming();
+      emit(state.copyWith(status: DiscoveryStatus.connected, clearError: true));
+    } catch (e) {
+      emit(state.copyWith(
+        status: DiscoveryStatus.error,
+        errorMessage: 'Failed to listen: $e',
+      ));
+    }
+  }
+
+  Future<void> stopListening() async {
+    await _transport.stopIncoming();
+    if (state.status == DiscoveryStatus.connected ||
+        state.status == DiscoveryStatus.searching) {
+      emit(state.copyWith(status: DiscoveryStatus.initial));
+    }
+  }
+
   Future<void> connectToDevice(DeviceInfo device) async {
     emit(state.copyWith(
       status: DiscoveryStatus.connecting,

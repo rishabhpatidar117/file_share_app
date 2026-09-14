@@ -4,6 +4,7 @@ class DeviceInfo {
   final DevicePlatform platform;
   final ConnectionQuality quality;
   final String? address;
+  final int? port;
 
   const DeviceInfo({
     required this.id,
@@ -11,6 +12,7 @@ class DeviceInfo {
     this.platform = DevicePlatform.unknown,
     this.quality = ConnectionQuality.good,
     this.address,
+    this.port,
   });
 
   DeviceInfo copyWith({
@@ -19,6 +21,7 @@ class DeviceInfo {
     DevicePlatform? platform,
     ConnectionQuality? quality,
     String? address,
+    int? port,
   }) {
     return DeviceInfo(
       id: id ?? this.id,
@@ -26,6 +29,7 @@ class DeviceInfo {
       platform: platform ?? this.platform,
       quality: quality ?? this.quality,
       address: address ?? this.address,
+      port: port ?? this.port,
     );
   }
 }

@@ -69,9 +69,51 @@ class NearbyTransport extends TransportChannel {
   }
 
   @override
-  Future<void> sendFileComplete(int fileIndex, String fileHash) async {
+  Future<void> sendFileComplete(
+    int fileIndex,
+    String fileHash, {
+    String fileName = '',
+    int fileSize = 0,
+    int totalChunks = 0,
+  }) async {
     // Send a completion marker payload.
   }
+
+  @override
+  Future<ResumePoints> sendSessionStart(
+    String sessionId,
+    String deviceName,
+    List<SessionFileMeta> files, {
+    int? chunkSize,
+  }) async {
+    return <int, int>{};
+  }
+
+  @override
+  Future<void> sendSessionComplete(String sessionId) async {}
+
+  @override
+  Future<void> startIncoming() async {
+    // In production: NearbyConnections.startAdvertising(...)
+  }
+
+  @override
+  Future<void> stopIncoming() async {}
+
+  @override
+  Future<void> acceptIncoming(String sessionId, ResumePoints resumePoints) async {}
+
+  @override
+  Future<void> sendChunkAck(int fileIndex, int chunkIndex) async {}
+
+  @override
+  Future<void> sendChunkError(int fileIndex, int chunkIndex) async {}
+
+  @override
+  Future<void> sendFileCompleteAck(int fileIndex) async {}
+
+  @override
+  Future<void> sendFileRetry(int fileIndex) async {}
 
   @override
   void pause() {
