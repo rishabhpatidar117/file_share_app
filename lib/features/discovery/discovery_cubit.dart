@@ -90,18 +90,21 @@ class DiscoveryCubit extends Cubit<DiscoveryState> {
     }
   }
 
-  Future<void> connectToDevice(DeviceInfo device) async {
+  Future<bool> connectToDevice(DeviceInfo device) async {
     emit(state.copyWith(
       status: DiscoveryStatus.connecting,
       selectedDevice: device,
     ));
     try {
       await _transport.connectToDevice(device);
+      emit(state.copyWith(status: DiscoveryStatus.connected, clearError: true));
+      return true;
     } catch (e) {
       emit(state.copyWith(
         status: DiscoveryStatus.error,
         errorMessage: 'Failed to connect to ${device.name}: $e',
       ));
+      return false;
     }
   }
 

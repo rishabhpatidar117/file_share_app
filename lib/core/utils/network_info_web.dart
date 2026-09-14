@@ -1,0 +1,1 @@
+Future<List<String>> getLocalIPv4Addresses() async => const [];

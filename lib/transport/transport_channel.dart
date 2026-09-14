@@ -3,6 +3,9 @@ import 'package:flutter/foundation.dart';
 import 'device_info.dart';
 import '../core/utils/chunker.dart';
 
+/// Default TCP service port shared across LAN transports.
+const int kSwiftShareServicePort = 48732;
+
 enum TransportState {
   disconnected,
   discovering,

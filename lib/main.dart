@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -5,6 +7,7 @@ import 'package:hive_flutter/hive_flutter.dart';
 import 'package:window_manager/window_manager.dart';
 import 'app/app.dart';
 import 'core/di/service_locator.dart';
+import 'core/services/permission_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -13,8 +16,15 @@ Future<void> main() async {
   await initServiceLocator();
 
   await _configureWindowAndOverlays();
+  unawaited(_requestRuntimePermissions());
 
   runApp(const SwiftShareApp());
+}
+
+Future<void> _requestRuntimePermissions() async {
+  final permissions = getIt<PermissionService>();
+  await permissions.ensureNetworkAccess();
+  await permissions.requestNotificationPermission();
 }
 
 Future<void> _configureWindowAndOverlays() async {

@@ -2,6 +2,7 @@ import 'package:get_it/get_it.dart';
 import 'package:hive/hive.dart';
 import 'package:window_manager/window_manager.dart';
 import '../services/notification_service.dart';
+import '../services/permission_service.dart';
 import '../../features/discovery/discovery_cubit.dart';
 import '../../features/transfer/transfer_cubit.dart';
 import '../../features/settings/settings_cubit.dart';
@@ -25,6 +26,8 @@ Future<void> initServiceLocator() async {
   final notifications = NotificationService();
   getIt.registerLazySingleton(() => notifications);
   await notifications.initialize();
+
+  getIt.registerLazySingleton(() => PermissionService(notifications));
 
   final deviceName = settingsBox.get('deviceName', defaultValue: 'My Device');
   transport.setDeviceName(deviceName);

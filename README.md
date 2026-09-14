@@ -11,7 +11,7 @@ UI, and a single shared codebase for the transfer/session logic.
 
 | Platform | Transport | Notes |
 |----------|-----------|-------|
-| Android  | `NearbyTransport` (Google Nearby Connections, `Strategy.P2P_STAR`) | Nearby Connections uses Bluetooth/BLE for discovery and handshake, then **automatically upgrades to Wi-Fi Direct / hotspot** for the bulk payload — no manual radio-switch code. |
+| Android  | `LanSocketTransport` (UDP beacon + raw TCP, `dart:io`) | The `NearbyTransport` wrapper exists for a future Wi-Fi Direct upgrade but is not wired up yet, so all native platforms use the same LAN socket transport. |
 | Windows  | `LanSocketTransport` (UDP beacon + raw TCP, `dart:io`) | mDNS-style UDP discovery beacon; length-prefixed framed messages over TCP for max throughput. |
 | Web      | `WebRtcTransport` (WebRTC DataChannels) | Browsers have no raw sockets or Bluetooth file access. Web uses secure P2P over WebRTC with QR/session-based signaling. |
 
@@ -23,9 +23,40 @@ standard OS capability**. The realistic, high-performing pattern is:
 - **Bluetooth/BLE for discovery + handshake**
 - **Wi-Fi (Wi-Fi Direct / LAN) for bulk data**
 
-Android's Nearby Connections already performs this exact behavior automatically.
 Windows mirrors it with UDP discovery + TCP data. Web has no OS radios at all, so
 it uses WebRTC DataChannels — the highest-speed P2P path a browser can offer.
+
+## Runtime permissions
+
+- LAN sockets need only the **INTERNET** permission, which is install-time
+  (auto-granted) on Android — no prompt required.
+- On Android 13+ the app requests `POST_NOTIFICATIONS` at startup
+  (`PermissionService`) so transfer progress/completion notifications still show.
+- The manifest no longer declares unused Bluetooth/Nearby/location permissions.
+
+## Android emulator ↔ desktop discovery
+
+The emulator runs behind a NAT, so UDP broadcast does not cross to the host. To
+connect a **desktop app** (sender) to an **emulator** (receiver), forward the
+service port and connect via the emulator's host alias (`10.0.2.2`):
+
+```sh
+adb shell ip route | grep default   # note the 10.0.2.x gateway
+adb forward tcp:48732 tcp:48732     # host:48732 -> emulator:48732
+```
+
+Then in the desktop app just tap the emulator device (its beacon is unicast to
+the host alias `10.0.2.2` automatically).
+
+To connect an **emulator** (sender) to a **desktop** (receiver), use the
+**"Connect by IP"** link button in the discovery screen and enter the host
+alias:
+
+```
+IP: 10.0.2.2    Port: 48732
+```
+
+For two real devices on the same Wi-Fi, broadcast discovery works with no setup.
 
 ## Architecture
 

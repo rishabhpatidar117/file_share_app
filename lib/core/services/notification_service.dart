@@ -16,6 +16,9 @@ class NotificationService {
       FlutterLocalNotificationsPlugin();
   bool _initialized = false;
 
+  /// Exposed for permission flows that need the same plugin instance.
+  FlutterLocalNotificationsPlugin get plugin => _plugin;
+
   Future<void> initialize() async {
     if (kIsWeb) return;
     if (_initialized) return;

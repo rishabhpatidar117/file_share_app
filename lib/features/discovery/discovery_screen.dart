@@ -1,15 +1,22 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_animate/flutter_animate.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'discovery_cubit.dart';
 import 'discovery_state.dart';
+import 'qr_scanner_screen.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text_styles.dart';
 import '../../core/utils/byte_formatter.dart';
+import '../../core/utils/network_info.dart';
 import '../../core/widgets/glass_card.dart';
 import '../../core/widgets/glass_toast.dart';
 import '../../core/widgets/gradient_background.dart';
 import '../../transport/device_info.dart';
+import '../../transport/qr_connect_payload.dart';
+import '../../transport/transport_channel.dart' show kSwiftShareServicePort;
+import '../settings/settings_cubit.dart';
 import '../transfer/transfer_cubit.dart';
 import '../transfer/transfer_state.dart';
 import '../transfer/session/transfer_session.dart';
@@ -25,22 +32,25 @@ class DiscoveryScreen extends StatefulWidget {
 }
 
 class _DiscoveryScreenState extends State<DiscoveryScreen> {
+  late final DiscoveryCubit _cubit;
+
   @override
   void initState() {
     super.initState();
+    _cubit = context.read<DiscoveryCubit>();
     if (widget.isSender) {
-      context.read<DiscoveryCubit>().startDiscovery();
+      _cubit.startDiscovery();
     } else {
-      context.read<DiscoveryCubit>().startReceive();
+      _cubit.startReceive();
     }
   }
 
   @override
   void dispose() {
     if (widget.isSender) {
-      context.read<DiscoveryCubit>().stopDiscovery();
+      _cubit.stopDiscovery();
     } else {
-      context.read<DiscoveryCubit>().stopListening();
+      _cubit.stopListening();
     }
     super.dispose();
   }
@@ -61,9 +71,9 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                     IconButton(
                       onPressed: () {
                         if (widget.isSender) {
-                          context.read<DiscoveryCubit>().stopDiscovery();
+                          _cubit.stopDiscovery();
                         } else {
-                          context.read<DiscoveryCubit>().stopListening();
+                          _cubit.stopListening();
                         }
                         Navigator.pop(context);
                       },
@@ -76,7 +86,20 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                         textAlign: TextAlign.center,
                       ),
                     ),
-                    const SizedBox(width: 48),
+                    const SizedBox(width: 8),
+                    if (widget.isSender) ...[
+                      IconButton(
+                        onPressed: _promptScanQrCode,
+                        icon: const Icon(Icons.qr_code_scanner),
+                        tooltip: 'Scan QR code to connect',
+                      ),
+                      IconButton(
+                        onPressed: _promptManualConnection,
+                        icon: const Icon(Icons.link),
+                        tooltip: 'Connect by IP address',
+                      ),
+                    ] else
+                      const SizedBox(width: 48),
                   ],
                 ),
               ),
@@ -117,6 +140,95 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     );
   }
 
+  Future<void> _promptManualConnection() async {
+    final ipController = TextEditingController();
+    final portController = TextEditingController(text: '48732');
+
+    final result = await showDialog<DeviceInfo>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: Theme.of(context).colorScheme.surface,
+        title: const Text('Connect by IP address'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: ipController,
+              keyboardType: TextInputType.url,
+              autocorrect: false,
+              decoration: const InputDecoration(
+                labelText: 'IP address',
+                hintText: 'e.g. 192.168.1.20',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: portController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Port',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final ip = ipController.text.trim();
+              final port = int.tryParse(portController.text.trim());
+              if (ip.isEmpty || port == null || port <= 0 || port > 65535) {
+                GlassToast.show(context, 'Enter a valid IP address and port');
+                return;
+              }
+              Navigator.pop(
+                context,
+                DeviceInfo(
+                  id: 'manual-$ip:$port',
+                  name: 'Manual ($ip)',
+                  platform: DevicePlatform.unknown,
+                  quality: ConnectionQuality.good,
+                  address: ip,
+                  port: port,
+                ),
+              );
+            },
+            child: const Text('Connect'),
+          ),
+        ],
+      ),
+    );
+
+    if (result == null || !mounted) return;
+    final connected = await _cubit.connectToDevice(result);
+    if (!mounted) return;
+    if (!connected) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const FilePickerScreen()),
+    );
+  }
+
+  Future<void> _promptScanQrCode() async {
+    final result = await Navigator.push<DeviceInfo>(
+      context,
+      MaterialPageRoute(builder: (_) => const QrScannerScreen()),
+    );
+    if (result == null || !mounted) return;
+    final connected = await _cubit.connectToDevice(result);
+    if (!mounted) return;
+    if (!connected) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const FilePickerScreen()),
+    );
+  }
+
   Widget _buildDeviceList(bool isDark) {
     return BlocBuilder<DiscoveryCubit, DiscoveryState>(
       builder: (context, state) {
@@ -133,10 +245,11 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
               child: _DeviceCard(
                 device: device,
                 isDark: isDark,
-                onTap: () {
-                  context.read<DiscoveryCubit>().connectToDevice(device);
+                onTap: () async {
+                  final connected = await _cubit.connectToDevice(device);
+                  if (!mounted || !connected) return;
                   Navigator.push(
-                    context,
+                    this.context,
                     MaterialPageRoute(
                       builder: (_) => const FilePickerScreen(),
                     ),
@@ -186,6 +299,11 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                   'The sender will see this device appear automatically.',
                   style: AppTextStyles.bodySmall(isDark: isDark),
                   textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 24),
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 24),
+                  child: _MyInfoPanel(compact: true),
                 ),
               ],
             ),
@@ -392,8 +510,9 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
 
   Widget _buildEmptyState(bool isDark) {
     return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
+      child: ListView(
+        shrinkWrap: true,
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
         children: [
           Icon(
             Icons.devices_other,
@@ -414,6 +533,20 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
             style: AppTextStyles.bodySmall(isDark: isDark),
             textAlign: TextAlign.center,
           ),
+          const SizedBox(height: 12),
+          TextButton.icon(
+            onPressed: _promptManualConnection,
+            icon: const Icon(Icons.link, size: 18),
+            label: const Text('Connect by IP address'),
+          ),
+          const SizedBox(height: 4),
+          TextButton.icon(
+            onPressed: _promptScanQrCode,
+            icon: const Icon(Icons.qr_code_scanner, size: 18),
+            label: const Text('Scan QR code'),
+          ),
+          const SizedBox(height: 16),
+          const _MyInfoPanel(compact: true),
         ],
       ),
     );
@@ -652,6 +785,137 @@ class _QualityIndicator extends StatelessWidget {
           ),
         );
       }),
+    );
+  }
+}
+
+/// Displays this device's IPv4 addresses (copyable) and, when in receive mode,
+/// a QR code the sender can scan.
+class _MyInfoPanel extends StatefulWidget {
+  final bool compact;
+  const _MyInfoPanel({this.compact = false});
+
+  @override
+  State<_MyInfoPanel> createState() => _MyInfoPanelState();
+}
+
+class _MyInfoPanelState extends State<_MyInfoPanel> {
+  late final Future<List<String>> _ipFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _ipFuture = getLocalIPv4Addresses();
+  }
+
+  Future<void> _copy(String text) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (mounted) GlassToast.show(context, 'Copied $text');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final deviceName =
+        context.select<SettingsCubit, String>((c) => c.state.deviceName);
+
+    return GlassCard(
+      padding: EdgeInsets.all(widget.compact ? 14 : 18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            'This device',
+            style: AppTextStyles.bodySmall(isDark: isDark),
+          ),
+          Text(
+            deviceName,
+            style: AppTextStyles.body(isDark: isDark),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 8),
+          FutureBuilder<List<String>>(
+            future: _ipFuture,
+            builder: (context, snapshot) {
+              if (!snapshot.hasData || snapshot.data!.isEmpty) {
+                return Text(
+                  'No local IP available',
+                  style: AppTextStyles.bodySmall(isDark: isDark),
+                );
+              }
+              final ips = snapshot.data!;
+              return Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final ip in ips)
+                    InkWell(
+                      onTap: () => _copy(ip),
+                      borderRadius: BorderRadius.circular(8),
+                      child: Container(
+                        padding:
+                            const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
+                          color:
+                              AppColors.primary.withValues(alpha: isDark ? 0.18 : 0.08),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.copy, size: 14, color: AppColors.primary),
+                            const SizedBox(width: 4),
+                            Text(
+                              '$ip : $kSwiftShareServicePort',
+                              style: AppTextStyles.bodySmall(isDark: isDark)
+                                  .copyWith(color: AppColors.primary),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+          if (!widget.compact) ...[
+            const SizedBox(height: 12),
+            FutureBuilder<List<String>>(
+              future: _ipFuture,
+              builder: (context, snapshot) {
+                final ips = snapshot.data ?? const <String>[];
+                if (ips.isEmpty) return const SizedBox.shrink();
+                final payload = QrConnectPayload(
+                  name: deviceName,
+                  ip: ips.first,
+                  port: kSwiftShareServicePort,
+                ).encode();
+                return Container(
+                  width: 136,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.1),
+                        blurRadius: 12,
+                      ),
+                    ],
+                  ),
+                  child: QrImageView(
+                    data: payload,
+                    version: QrVersions.auto,
+                    size: 116,
+                  ),
+                );
+              },
+            ),
+          ],
+        ],
+      ),
     );
   }
 }

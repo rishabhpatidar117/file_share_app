@@ -18,8 +18,14 @@ import '../../core/utils/chunker.dart';
 /// Direction rule: the device that opens the TCP connection is the SENDER for
 /// that connection; the listening device is the RECEIVER.
 class LanSocketTransport extends TransportChannel {
-  static const int servicePort = 48732;
+  static const int servicePort = kSwiftShareServicePort;
   static const int discoveryPort = 48733;
+
+  /// Android emulator alias for the host machine's loopback interface.
+  /// Broadcasts stay inside the emulator's NAT, so also unicast beacons here
+  /// so a desktop app on the host can discover the emulator (paired with
+  /// `adb forward tcp:48732 tcp:48732` so the host can connect back).
+  static const String androidEmulatorHostAlias = '10.0.2.2';
 
   ServerSocket? _serverSocket;
   Socket? _connectedSocket;
@@ -35,6 +41,7 @@ class LanSocketTransport extends TransportChannel {
   // Message framing buffer.
   final List<int> _receiveBuffer = [];
   bool _listening = false;
+  bool _discovering = false;
 
   // Sender-side futures awaiting receiver acks.
   final Map<String, Completer<void>> _chunkAckWaiters = {};
@@ -60,7 +67,7 @@ class LanSocketTransport extends TransportChannel {
       InternetAddress.anyIPv4,
       discoveryPort,
       reuseAddress: true,
-      reusePort: true,
+      reusePort: Platform.isLinux || Platform.isMacOS,
     );
     _discoverySocket!.broadcastEnabled = true;
     _discoverySub = _discoverySocket!.listen((event) {
@@ -102,7 +109,7 @@ class LanSocketTransport extends TransportChannel {
       'type': 'swiftshare_beacon',
       'id': _instanceId,
       'name': _deviceName,
-      'platform': 'windows',
+      'platform': _platformString,
       'port': servicePort,
     }));
     try {
@@ -112,34 +119,66 @@ class LanSocketTransport extends TransportChannel {
         discoveryPort,
       );
     } catch (_) {}
+    // The Android emulator's broadcast stays in its own NAT, so also unicast
+    // to the host loopback alias the desktop app listens on.
+    if (Platform.isAndroid) {
+      try {
+        _discoverySocket!.send(
+          beacon,
+          InternetAddress(androidEmulatorHostAlias),
+          discoveryPort,
+        );
+      } catch (_) {}
+    }
   }
 
   @override
   Future<void> startDiscovery({Duration timeout = const Duration(seconds: 15)}) async {
-    if (state == TransportState.discovering) return;
+    if (_discovering) return;
     updateState(TransportState.discovering);
+    _discovering = true;
     _discoveredDevices.clear();
 
     await _ensureDiscoverySocket();
     _scanTimeout?.cancel();
     _scanTimeout = Timer(timeout, () => stopDiscovery());
 
-    _beaconTimer?.cancel();
+    _startBeaconTimer();
+    _sendBeacon();
+  }
+
+  void _startBeaconTimer() {
+    if (_beaconTimer != null) return;
     _beaconTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       _sendBeacon();
     });
-    _sendBeacon();
+  }
+
+  void _stopBeaconTimer() {
+    _beaconTimer?.cancel();
+    _beaconTimer = null;
+  }
+
+  void _closeDiscoverySocketIfIdle() {
+    if (_listening || _discovering) return;
+    _discoverySub?.cancel();
+    _discoverySub = null;
+    _discoverySocket?.close();
+    _discoverySocket = null;
   }
 
   @override
   Future<void> stopDiscovery() async {
     _scanTimeout?.cancel();
     _scanTimeout = null;
-    _beaconTimer?.cancel();
-    _beaconTimer = null;
+    _discovering = false;
+    if (!_listening) {
+      _stopBeaconTimer();
+    }
     if (state == TransportState.discovering) {
       updateState(TransportState.disconnected);
     }
+    _closeDiscoverySocketIfIdle();
   }
 
   DevicePlatform _platformFromString(String? p) {
@@ -153,6 +192,13 @@ class LanSocketTransport extends TransportChannel {
       default:
         return DevicePlatform.unknown;
     }
+  }
+
+  String get _platformString {
+    if (Platform.isAndroid) return 'android';
+    if (Platform.isIOS) return 'ios';
+    if (Platform.isWindows) return 'windows';
+    return 'other';
   }
 
   // ---------------------------------------------------------------------------
@@ -174,7 +220,7 @@ class LanSocketTransport extends TransportChannel {
       await _sendMessage(socket, {
         'type': 'hello',
         'name': _deviceName,
-        'platform': 'windows',
+        'platform': _platformString,
       });
       updateState(TransportState.connected);
     } catch (e) {
@@ -194,6 +240,10 @@ class LanSocketTransport extends TransportChannel {
       );
       _listening = true;
       _serverSocket!.listen(_handleIncomingConnection);
+      // Advertise so senders can find this receiver in discovery.
+      await _ensureDiscoverySocket();
+      _startBeaconTimer();
+      _sendBeacon();
     } catch (_) {
       // Another listening instance already owns the port; keep going.
     }
@@ -204,6 +254,10 @@ class LanSocketTransport extends TransportChannel {
     await _serverSocket?.close();
     _serverSocket = null;
     _listening = false;
+    _closeDiscoverySocketIfIdle();
+    if (!_discovering) {
+      _stopBeaconTimer();
+    }
   }
 
   void _handleIncomingConnection(Socket socket) {
@@ -214,7 +268,7 @@ class LanSocketTransport extends TransportChannel {
     _sendMessage(socket, {
       'type': 'hello_ack',
       'name': _deviceName,
-      'platform': 'windows',
+      'platform': _platformString,
     });
   }
 
@@ -272,7 +326,7 @@ class LanSocketTransport extends TransportChannel {
         _sendMessage(socket, {
           'type': 'hello_ack',
           'name': _deviceName,
-          'platform': 'windows',
+          'platform': _platformString,
         });
         break;
 
