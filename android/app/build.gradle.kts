@@ -15,6 +15,14 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
         isCoreLibraryDesugaringEnabled = true
     }
+    signingConfigs {
+        create("release") {
+            storeFile = file("./keys.jks")
+            storePassword = "qwserdxcfgvhbjoiukthytgbfiu65y4t232w3erfg8i87u6ytgre2awserdtfyg"
+            keyAlias = "key11"
+            keyPassword = "qwserdxcfgvhbjoiukthytgbfiu65y4t232w3erfg8i87u6ytgre2awserdtfyg"
+        }
+    }
 
     kotlinOptions {
         jvmTarget = JavaVersion.VERSION_17.toString()
@@ -35,7 +43,12 @@ android {
         release {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
+        }
+        debug {
+            // TODO: Add your own signing config for the release build.
+            // Signing with the debug keys for now, so `flutter run --release` works.
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 }
