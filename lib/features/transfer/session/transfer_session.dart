@@ -97,6 +97,7 @@ class TransferSession {
   final List<TransferFileManifest> files;
   final DateTime createdAt;
   final DateTime? completedAt;
+  final bool isArchived;
 
   const TransferSession({
     required this.id,
@@ -106,6 +107,7 @@ class TransferSession {
     this.files = const [],
     required this.createdAt,
     this.completedAt,
+    this.isArchived = false,
   });
 
   int get totalBytes => files.fold(0, (sum, f) => sum + f.fileSize);
@@ -124,6 +126,7 @@ class TransferSession {
     SessionStatus? status,
     List<TransferFileManifest>? files,
     DateTime? completedAt,
+    bool? isArchived,
   }) {
     return TransferSession(
       id: id,
@@ -133,18 +136,20 @@ class TransferSession {
       files: files ?? this.files,
       createdAt: createdAt,
       completedAt: completedAt ?? this.completedAt,
+      isArchived: isArchived ?? this.isArchived,
     );
   }
 
   Map<String, dynamic> toJson() => {
-    'id': id,
-    'remoteDeviceName': remoteDeviceName,
-    'isSender': isSender,
-    'status': status.index,
-    'files': files.map((f) => f.toJson()).toList(),
-    'createdAt': createdAt.toIso8601String(),
-    'completedAt': completedAt?.toIso8601String(),
-  };
+        'id': id,
+        'remoteDeviceName': remoteDeviceName,
+        'isSender': isSender,
+        'status': status.index,
+        'files': files.map((f) => f.toJson()).toList(),
+        'createdAt': createdAt.toIso8601String(),
+        'completedAt': completedAt?.toIso8601String(),
+        'isArchived': isArchived,
+      };
 
   factory TransferSession.fromJson(Map<String, dynamic> json) =>
       TransferSession(
@@ -160,5 +165,6 @@ class TransferSession {
         completedAt: json['completedAt'] != null
             ? DateTime.parse(json['completedAt'])
             : null,
+        isArchived: json['isArchived'] ?? false,
       );
 }

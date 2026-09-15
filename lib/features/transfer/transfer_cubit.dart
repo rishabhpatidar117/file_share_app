@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:flutter/foundation.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
@@ -12,6 +12,7 @@ import '../../transport/transport_channel.dart';
 import '../../core/services/notification_service.dart';
 import '../../core/utils/chunker.dart';
 import '../../core/utils/crc32c.dart';
+import '../../core/utils/file_categorizer.dart';
 import '../file_picker/file_picker_state.dart';
 
 class TransferCubit extends Cubit<TransferState> {
@@ -464,9 +465,10 @@ class TransferCubit extends Cubit<TransferState> {
     final saveDir = await _resolveSaveDirectory();
     final manifests = <TransferFileManifest>[];
     for (final meta in request.files) {
+      final dest = await SwiftShareStore.createDestination(saveDir, meta.fileName);
       manifests.add(TransferFileManifest(
         fileName: meta.fileName,
-        filePath: '$saveDir/${meta.fileName}',
+        filePath: dest.path,
         fileSize: meta.fileSize,
         expectedHash: meta.sha256,
         totalChunks: meta.totalChunks,
@@ -489,11 +491,11 @@ class TransferCubit extends Cubit<TransferState> {
     // Resume from any partial (<.swiftshare.part>) files already on disk.
     final resume = <int, int>{};
     for (var i = 0; i < request.files.length; i++) {
-      final meta = request.files[i];
-      final part = File('$saveDir/${meta.fileName}.swiftshare.part');
+      final manifest = manifests[i];
+      final part = File('${manifest.filePath}.swiftshare.part');
       if (await part.exists()) {
         final len = await part.length();
-        resume[i] = _nextChunkForBytes(len, meta.totalChunks);
+        resume[i] = _nextChunkForBytes(len, request.files[i].totalChunks);
       } else {
         resume[i] = 0;
       }
@@ -645,15 +647,18 @@ class TransferCubit extends Cubit<TransferState> {
   }
 
   Future<String> _resolveSaveDirectory() async {
+    final userLocation = _settingsBox.get('saveLocation') as String?;
     try {
-      if (!kIsWeb) {
-        final downloads = await getDownloadsDirectory();
-        if (downloads != null) return downloads.path;
-        final docs = await getApplicationDocumentsDirectory();
-        return docs.path;
-      }
-    } catch (_) {}
-    return Directory.current.path;
+      return await SwiftShareStore.resolveRoot(userLocation);
+    } catch (_) {
+      try {
+        if (!kIsWeb) {
+          final docs = await getApplicationDocumentsDirectory();
+          return docs.path;
+        }
+      } catch (_) {}
+      return Directory.current.path;
+    }
   }
 
   @override

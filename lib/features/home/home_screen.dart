@@ -93,8 +93,9 @@ class _HomeScreenState extends State<HomeScreen> {
         backgroundColor: isDark
             ? AppColors.darkBackground.withValues(alpha: 0.9)
             : Colors.white.withValues(alpha: 0.9),
-        indicatorColor: AppColors.primary.withValues(alpha: 0.15),
+        indicatorColor: Colors.transparent,
         surfaceTintColor: Colors.transparent,
+        overlayColor: WidgetStateProperty.all(Colors.transparent),
         destinations: const [
           NavigationDestination(
             icon: Icon(Icons.home_outlined),

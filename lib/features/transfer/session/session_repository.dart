@@ -33,6 +33,12 @@ class SessionRepository {
     await _box.delete(id);
   }
 
+  Future<void> setArchived(String id, bool archived) async {
+    final session = await getSession(id);
+    if (session == null) return;
+    await saveSession(session.copyWith(isArchived: archived));
+  }
+
   Future<void> updateSession(TransferSession session) async {
     await saveSession(session);
   }
