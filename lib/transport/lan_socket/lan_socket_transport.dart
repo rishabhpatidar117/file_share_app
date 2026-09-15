@@ -539,7 +539,7 @@ class LanSocketTransport extends TransportChannel {
       'data': base64Encode(data),
     });
     await completer.future.timeout(
-      const Duration(seconds: 60),
+      const Duration(seconds: 30),
       onTimeout: () {
         _chunkAckWaiters.remove(key);
         throw TransportException('Chunk $metadata.index timed out');
@@ -566,11 +566,17 @@ class LanSocketTransport extends TransportChannel {
       'size': fileSize,
       'totalChunks': totalChunks,
     });
-    await completer.future.timeout(
-      const Duration(seconds: 60),
-      onTimeout: () => completer.complete(),
-    );
-    _fileAckWaiters.remove(fileIndex);
+    try {
+      await completer.future.timeout(
+        const Duration(seconds: 180),
+        onTimeout: () {
+          _fileAckWaiters.remove(fileIndex);
+          throw TransportException('File $fileIndex completion timed out');
+        },
+      );
+    } finally {
+      _fileAckWaiters.remove(fileIndex);
+    }
   }
 
   @override

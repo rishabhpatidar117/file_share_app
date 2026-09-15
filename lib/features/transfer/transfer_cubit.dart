@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:hive/hive.dart';
@@ -46,6 +47,24 @@ class TransferCubit extends Cubit<TransferState> {
   String? _incomingSaveDir;
   int _incomingChunkSize = 512 * 1024;
   final Map<int, RandomAccessFile> _incomingRafs = {};
+  String? _incomingSessionId;
+
+  /// Serializes disk writes per file so concurrent inbound chunks can never
+  /// interleave offsets on the same RandomAccessFile.
+  final Map<int, Future<void>> _incomingWriteChains = {};
+
+  /// Number of contiguous chunks ([0, n)) already flushed to disk per file.
+  /// Never recedes, so progress and resume points stay accurate even with
+  /// out-of-order retransmits.
+  final Map<int, int> _incomingContiguousChunks = {};
+
+  /// Chunks accepted from the wire but not yet writable because a lower index
+  /// is still being retransmitted. Bounded by the sender's in-flight window.
+  final Map<int, Map<int, Uint8List>> _incomingPendingChunks = {};
+
+  /// Files a whole-file resend is in progress for; such files always restart
+  /// at chunk 0 regardless of previously acked progress.
+  final Set<int> _forcedRestartFiles = {};
 
   TransferCubit(
     this._transport,
@@ -171,6 +190,7 @@ class TransferCubit extends Cubit<TransferState> {
     _lastProgressBytes = 0;
     _lastSpeedSample = DateTime.now();
     _isPaused = false;
+    _forcedRestartFiles.clear();
 
     _notifications.showTransferProgress(
       title: 'SwiftShare',
@@ -227,9 +247,14 @@ class TransferCubit extends Cubit<TransferState> {
       var fileOk = false;
       String hash = '';
       try {
-        var current = _resumePoints[_currentFileIndex] ??
-            fileManifest.lastAckedChunk + 1;
-        if (current < 0 || current >= reader.totalChunks) current = 0;
+        final receiverStart = _resumePoints[_currentFileIndex] ?? 0;
+        final fromLastAck = fileManifest.lastAckedChunk + 1;
+        // Whole-file resends (rejected file) start from scratch; otherwise
+        // continue from whichever side knows more data is already on disk.
+        var current = _forcedRestartFiles.contains(_currentFileIndex)
+            ? 0
+            : (receiverStart > fromLastAck ? receiverStart : fromLastAck);
+        if (current < 0) current = 0;
         _currentChunkIndex = current;
         _highestAckedChunk = current;
 
@@ -283,8 +308,10 @@ class TransferCubit extends Cubit<TransferState> {
             );
             fileOk = true;
           } on TransportException {
-            // Receiver flagged a corrupt whole file; resend it from scratch.
+            // Receiver flagged a corrupt whole file (or never acked it):
+            // resend every chunk from scratch instead of trusting old progress.
             _resumePoints[_currentFileIndex] = 0;
+            _forcedRestartFiles.add(_currentFileIndex);
           }
         }
       } catch (e) {
@@ -307,6 +334,7 @@ class TransferCubit extends Cubit<TransferState> {
 
       _updateFileStatus(_currentFileIndex, FileTransferStatus.completed,
           actualHash: hash);
+      _forcedRestartFiles.remove(_currentFileIndex);
       _currentFileIndex++;
       _resumePoints.clear();
     }
@@ -341,6 +369,7 @@ class TransferCubit extends Cubit<TransferState> {
   }
 
   Future<void> _sendChunkWithRetry(int fileIndex, ChunkData chunk) async {
+    const maxAttempts = 100;
     var attempts = 0;
     while (true) {
       attempts++;
@@ -348,9 +377,18 @@ class TransferCubit extends Cubit<TransferState> {
         await _transport.sendChunk(fileIndex, chunk.metadata, chunk.bytes);
         return;
       } on TransportException {
+        // If the transport is paused (socket closed, user tapped pause) the
+        // transfer loop will notice on the next iteration — just return here.
         if (_isPaused) return;
-        if (attempts >= 3) rethrow;
-        await Future.delayed(const Duration(milliseconds: 250));
+        final ts = _transport.state;
+        if (ts == TransportState.disconnected ||
+            ts == TransportState.paused ||
+            ts == TransportState.error) {
+          return;
+        }
+        if (attempts >= maxAttempts) rethrow;
+        final backoff = 250 * (1 << (attempts - 1).clamp(0, 4));
+        await Future.delayed(Duration(milliseconds: backoff));
       }
     }
   }
@@ -542,6 +580,10 @@ class TransferCubit extends Cubit<TransferState> {
       } catch (_) {}
     }
     _incomingRafs.clear();
+    _incomingWriteChains.clear();
+    _incomingPendingChunks.clear();
+    _incomingContiguousChunks.clear();
+    _incomingSessionId = null;
 
     emit(const TransferState());
   }
@@ -577,16 +619,43 @@ class TransferCubit extends Cubit<TransferState> {
     _incomingSaveDir = saveDir;
     _incomingChunkSize = request.chunkSize > 0 ? request.chunkSize : _chunkSize;
 
-    // Resume from any partial (<.swiftshare.part>) files already on disk.
+    // Reset all receiver bookkeeping when a genuinely new session arrives.
+    // When the same session is re-negotiated (pause/resume) the warm prefix
+    // maps are kept so we don't need to re-verify data already on disk.
+    if (_incomingSessionId != request.sessionId) {
+      _incomingSessionId = request.sessionId;
+      for (final raf in _incomingRafs.values) {
+        try {
+          await raf.close();
+        } catch (_) {}
+      }
+      _incomingRafs.clear();
+      _incomingWriteChains.clear();
+      _incomingPendingChunks.clear();
+      _incomingContiguousChunks.clear();
+    }
+
+    // Resume from the contiguous on-disk prefix when available (accurate
+    // for both offset-based retransmits and sequential writes).  Fall back
+    // to the legacy length heuristic for cold-starts after app restarts
+    // when the warm maps were lost.
     final resume = <int, int>{};
     for (var i = 0; i < request.files.length; i++) {
       final manifest = manifests[i];
-      final part = File('${manifest.filePath}.swiftshare.part');
-      if (await part.exists()) {
-        final len = await part.length();
-        resume[i] = _nextChunkForBytes(len, request.files[i].totalChunks);
+      final warmPrefix = _incomingContiguousChunks[i];
+      if (warmPrefix != null && warmPrefix > 0) {
+        // The sender starts at the reported index, so reporting a fully
+        // received file (== totalChunks) makes it skip straight to the
+        // file_complete verification.
+        resume[i] = warmPrefix;
       } else {
-        resume[i] = 0;
+        final part = File('${manifest.filePath}.swiftshare.part');
+        if (await part.exists()) {
+          final len = await part.length();
+          resume[i] = _nextChunkForBytes(len, request.files[i].totalChunks);
+        } else {
+          resume[i] = 0;
+        }
       }
     }
 
@@ -603,25 +672,78 @@ class TransferCubit extends Cubit<TransferState> {
   Future<void> _onIncomingChunk(ChunkReceivedEvent event) async {
     final incoming = _incoming;
     if (incoming == null) return;
-    final manifest = incoming.files[event.fileIndex];
+
+    // Serialize per-file writes: broadcast streams may deliver multiple chunk
+    // events while an earlier async handler is still flushing.  Chaining
+    // ensures each file's RandomAccessFile sees setPosition/write calls in the
+    // order they arrive, and retried chunks land at their correct offset
+    // regardless of when they showed up.
+    final chain =
+        _incomingWriteChains[event.fileIndex] ?? Future<void>.value();
+    final next = chain.catchError((_) {}).then(
+          (_) => _processIncomingChunk(event),
+        );
+    _incomingWriteChains[event.fileIndex] = next.catchError((_) {});
+    return next;
+  }
+
+  Future<void> _processIncomingChunk(ChunkReceivedEvent event) async {
+    final incoming = _incoming;
+    if (incoming == null) return;
+    final fileIndex = event.fileIndex;
+    final manifest = incoming.files[fileIndex];
     final partPath = '${manifest.filePath}.swiftshare.part';
 
     try {
       final actualCrc = Crc32c.hash(event.data);
       if (actualCrc != event.metadata.crc32cChecksum) {
-        await _transport.sendChunkError(event.fileIndex, event.metadata.index);
+        await _transport.sendChunkError(fileIndex, event.metadata.index);
         return;
       }
 
-      final raf = _incomingRafs[event.fileIndex] ??=
+      final prefix = _incomingContiguousChunks[fileIndex] ?? 0;
+
+      if (event.metadata.index < prefix) {
+        // A retransmitted chunk whose data is already on disk — ack and move on.
+        await _transport.sendChunkAck(fileIndex, event.metadata.index);
+        return;
+      }
+
+      if (event.metadata.index > prefix) {
+        // An earlier chunk (the gap) is being retransmitted. Hold this one in
+        // memory (bounded by the sender's in-flight window) until the missing
+        // chunk arrives, then flush everything in order. Writing strictly in
+        // order keeps the part file contiguous, so a late retransmit can never
+        // corrupt other chunks' data.
+        (_incomingPendingChunks[fileIndex] ??= <int, Uint8List>{})
+            [event.metadata.index] = event.data;
+        await _transport.sendChunkAck(fileIndex, event.metadata.index);
+        return;
+      }
+
+      // Sequential chunk: append right after the contiguous prefix.
+      final raf = _incomingRafs[fileIndex] ??=
           await File(partPath).open(mode: FileMode.append);
       await raf.writeFrom(event.data);
-      await raf.flush();
 
-      _pumpIncomingProgress(event.fileIndex, event.metadata.index + 1);
-      await _transport.sendChunkAck(event.fileIndex, event.metadata.index);
+      _incomingContiguousChunks[fileIndex] = prefix + 1;
+
+      // Flush any buffered chunks that are now contiguous, strictly in order.
+      var next = prefix + 1;
+      final pending = _incomingPendingChunks[fileIndex];
+      if (pending != null) {
+        while (pending.containsKey(next)) {
+          await raf.writeFrom(pending.remove(next)!);
+          next++;
+        }
+      }
+      await raf.flush();
+      _incomingContiguousChunks[fileIndex] = next;
+
+      _pumpIncomingProgress(fileIndex, next);
+      await _transport.sendChunkAck(fileIndex, event.metadata.index);
     } catch (e) {
-      await _transport.sendChunkError(event.fileIndex, event.metadata.index);
+      await _transport.sendChunkError(fileIndex, event.metadata.index);
     }
   }
 
@@ -639,7 +761,36 @@ class TransferCubit extends Cubit<TransferState> {
       } catch (_) {}
     }
 
-    if (!await partFile.exists() || await partFile.length() != manifest.fileSize) {
+    if (!await partFile.exists()) {
+      // A duplicate marker (or crash after rename) can leave the part file
+      // gone but the final file already in place.  Verify and ack rather
+      // than triggering a needless full resend.
+      final finalFile = File(manifest.filePath);
+      if (await finalFile.exists() &&
+          await finalFile.length() == manifest.fileSize) {
+        if (event.sha256.isNotEmpty) {
+          final existingHash = await computeFileHash(manifest.filePath);
+          if (existingHash != event.sha256) {
+            await _incomingFailFile(event.fileIndex);
+            return;
+          }
+        }
+        await _transport.sendFileCompleteAck(event.fileIndex);
+        final files = List<TransferFileManifest>.from(_incoming!.files);
+        files[event.fileIndex] = files[event.fileIndex].copyWith(
+          status: FileTransferStatus.completed,
+          chunksSent: files[event.fileIndex].totalChunks,
+          lastAckedChunk: files[event.fileIndex].totalChunks - 1,
+        );
+        _incoming = _incoming!.copyWith(files: files);
+        emit(state.copyWith(incomingSession: _incoming, incomingError: null));
+        return;
+      }
+      await _incomingFailFile(event.fileIndex);
+      return;
+    }
+
+    if (await partFile.length() != manifest.fileSize) {
       await _incomingFailFile(event.fileIndex);
       return;
     }
@@ -663,6 +814,8 @@ class TransferCubit extends Cubit<TransferState> {
       actualHash: actualHash,
     );
     _incoming = _incoming!.copyWith(files: files);
+    _incomingContiguousChunks.remove(event.fileIndex);
+    _incomingPendingChunks.remove(event.fileIndex);
     emit(state.copyWith(incomingSession: _incoming, incomingError: null));
   }
 
@@ -680,6 +833,8 @@ class TransferCubit extends Cubit<TransferState> {
         await raf.close();
       } catch (_) {}
     }
+    _incomingPendingChunks.remove(fileIndex);
+    _incomingContiguousChunks.remove(fileIndex);
 
     final files = List<TransferFileManifest>.from(_incoming!.files);
     files[fileIndex] = files[fileIndex].copyWith(
@@ -702,6 +857,10 @@ class TransferCubit extends Cubit<TransferState> {
       } catch (_) {}
     }
     _incomingRafs.clear();
+    _incomingWriteChains.clear();
+    _incomingPendingChunks.clear();
+    _incomingContiguousChunks.clear();
+    _incomingSessionId = null;
 
     final completed = incoming.copyWith(
       status: SessionStatus.completed,

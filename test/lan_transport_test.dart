@@ -35,15 +35,20 @@ void main() {
   /// connectToDevice returns as soon as `hello` is queued; the `hello_ack`
   /// arrives asynchronously. Wait for the handshake to complete so assertions
   /// on the transport state are not racing the socket listener.
-  Future<void> waitForConnected(LanSocketTransport t,
+  Future<void> waitForState(LanSocketTransport t, TransportState expected,
       {Duration timeout = const Duration(seconds: 5)}) async {
     final deadline = DateTime.now().add(timeout);
-    while (t.state != TransportState.connected) {
+    while (t.state != expected) {
       if (DateTime.now().isAfter(deadline)) {
-        fail('Timed out waiting for connected state');
+        fail('Timed out waiting for state $expected (was ${t.state})');
       }
       await Future.delayed(const Duration(milliseconds: 10));
     }
+  }
+
+  Future<void> waitForConnected(LanSocketTransport t,
+      {Duration timeout = const Duration(seconds: 5)}) {
+    return waitForState(t, TransportState.connected, timeout: timeout);
   }
 
   test('full session: negotiate, chunk, ack and verify a real file', () async {
@@ -344,7 +349,154 @@ void main() {
     final gone = await peerGone.timeout(const Duration(seconds: 5));
     expect(gone, 'Loopback');
     // Sender has no local server running; the receiver keeps listening.
-    expect(sender.state, TransportState.disconnected);
+    await waitForState(sender, TransportState.disconnected);
     expect(receiver.state, TransportState.listening);
+  });
+
+  test('retransmit of a rejected chunk recovers on second send', () async {
+    sourcePath = '${sandbox.path}/retry.bin';
+    await File(sourcePath).writeAsBytes(List.filled(64, 7));
+    final reader = ChunkedFileReader(file: File(sourcePath));
+    final sourceHash = await computeFileHash(sourcePath);
+
+    final receivedData = <Uint8List>[];
+    final gotAll = Completer<void>();
+    var rejectedOnce = false;
+
+    receiver.onIncomingSession.listen((s) async {
+      await receiver.acceptIncoming(s.sessionId, {0: 0});
+    });
+
+    receiver.onChunkReceived.listen((event) async {
+      // First arrival: reject (simulates CRC mismatch).  The retransmit
+      // (same chunk index) is accepted.
+      if (!rejectedOnce) {
+        rejectedOnce = true;
+        await receiver.sendChunkError(event.fileIndex, event.metadata.index);
+      } else {
+        receivedData.add(event.data);
+        await receiver.sendChunkAck(event.fileIndex, event.metadata.index);
+        if (!gotAll.isCompleted) gotAll.complete();
+      }
+    });
+
+    receiver.onIncomingFileComplete.listen((event) async {
+      await receiver.sendFileCompleteAck(event.fileIndex);
+    });
+
+    await sender.connectToDevice(const DeviceInfo(
+      id: 'loopback',
+      name: 'Loopback',
+      address: '127.0.0.1',
+      port: LanSocketTransport.servicePort,
+    ));
+    await waitForConnected(sender);
+
+    await sender.sendSessionStart(
+      'session-retry',
+      'SenderTest',
+      const [
+        SessionFileMeta(index: 0, fileName: 'retry.bin', fileSize: 64, totalChunks: 1),
+      ],
+    );
+
+    final chunk = await reader.readChunk(0);
+    // First send → receiver errors it back.
+    try {
+      await sender.sendChunk(0, chunk.metadata, chunk.bytes);
+      fail('Expected TransportException');
+    } catch (_) {
+      // Receiver rejected the chunk as expected.
+    }
+    // Retransmit → receiver accepts.
+    await sender.sendChunk(0, chunk.metadata, chunk.bytes);
+    await gotAll.future.timeout(const Duration(seconds: 10));
+
+    expect(receivedData.single, chunk.bytes);
+
+    await sender.sendFileComplete(
+      0,
+      sourceHash,
+      fileName: 'retry.bin',
+      fileSize: reader.totalSize,
+      totalChunks: 1,
+    );
+  });
+
+  test('chunks delivered out of order reconstruct the correct data', () async {
+    sourcePath = '${sandbox.path}/ooo.bin';
+    final data = Uint8List.fromList([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    await File(sourcePath).writeAsBytes(data);
+    final reader = ChunkedFileReader(file: File(sourcePath), chunkSize: 4);
+    expect(reader.totalChunks, 3); // [1..4] [5..8] [9,10]
+    final sourceHash = await computeFileHash(sourcePath);
+
+    final receivedParts = <int, Uint8List>{};
+    final deliveryOrder = <int>[];
+    final gotAll = Completer<void>();
+
+    receiver.onIncomingSession.listen((s) async {
+      await receiver.acceptIncoming(s.sessionId, {0: 0});
+    });
+    receiver.onChunkReceived.listen((event) async {
+      deliveryOrder.add(event.metadata.index);
+      receivedParts[event.metadata.index] = event.data;
+      await receiver.sendChunkAck(event.fileIndex, event.metadata.index);
+      if (receivedParts.length == reader.totalChunks && !gotAll.isCompleted) {
+        gotAll.complete();
+      }
+    });
+    receiver.onIncomingFileComplete.listen((event) async {
+      await receiver.sendFileCompleteAck(event.fileIndex);
+    });
+
+    await sender.connectToDevice(const DeviceInfo(
+      id: 'loopback',
+      name: 'Loopback',
+      address: '127.0.0.1',
+      port: LanSocketTransport.servicePort,
+    ));
+    await waitForConnected(sender);
+
+    await sender.sendSessionStart(
+      'session-ooo',
+      'SenderTest',
+      const [
+        SessionFileMeta(
+          index: 0,
+          fileName: 'ooo.bin',
+          fileSize: 10,
+          totalChunks: 3,
+        ),
+      ],
+      chunkSize: 4,
+    );
+
+    // Read all chunks, then send in out-of-order sequence: 0 → 2 → 1.
+    final chunks = <ChunkData>[];
+    for (var i = 0; i < reader.totalChunks; i++) {
+      chunks.add(await reader.readChunk(i));
+    }
+    await sender.sendChunk(0, chunks[0].metadata, chunks[0].bytes);
+    await sender.sendChunk(0, chunks[2].metadata, chunks[2].bytes);
+    await sender.sendChunk(0, chunks[1].metadata, chunks[1].bytes);
+    await gotAll.future.timeout(const Duration(seconds: 10));
+
+    expect(deliveryOrder, [0, 2, 1]); // confirm out-of-order delivery
+
+    // Reassemble in logical chunk order and verify correctness.
+    final reassembled = <int>[];
+    for (var i = 0; i < reader.totalChunks; i++) {
+      reassembled.addAll(receivedParts[i]!);
+    }
+    expect(reassembled, data);
+
+    await sender.sendFileComplete(
+      0,
+      sourceHash,
+      fileName: 'ooo.bin',
+      fileSize: reader.totalSize,
+      totalChunks: 3,
+    );
   });
 }
