@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_animate/flutter_animate.dart';
@@ -8,6 +9,7 @@ import '../../core/theme/app_text_styles.dart';
 import '../../core/utils/byte_formatter.dart';
 import '../../core/widgets/glass_card.dart';
 import '../../core/widgets/gradient_background.dart';
+import '../camera/camera_capture_screen.dart';
 import '../transfer/transfer_cubit.dart';
 import '../transfer/transfer_screen.dart';
 
@@ -23,6 +25,36 @@ class FilePickerScreen extends StatefulWidget {
 }
 
 class _FilePickerScreenState extends State<FilePickerScreen> {
+  bool get _cameraSupported {
+    if (!kIsWeb) {
+      switch (defaultTargetPlatform) {
+        case TargetPlatform.android:
+        case TargetPlatform.iOS:
+        // camera_desktop covers Windows/macOS/Linux, Windows included.
+        case TargetPlatform.windows:
+        case TargetPlatform.macOS:
+        case TargetPlatform.linux:
+          return true;
+        default:
+          return false;
+      }
+    }
+    return false;
+  }
+
+  Future<void> _captureFromCamera() async {
+    final result = await Navigator.push<List<String>>(
+      context,
+      MaterialPageRoute(builder: (_) => const CameraCaptureScreen()),
+    );
+    if (result == null || result.isEmpty || !mounted) return;
+    final cubit = context.read<FilePickerCubit>();
+    cubit.pickFilesFromPath(result);
+    if (cubit.state.status == FilePickerStatus.initial) {
+      setState(() {});
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -194,6 +226,24 @@ class _FilePickerScreenState extends State<FilePickerScreen> {
               ),
             ),
           ).animate().fadeIn(delay: 200.ms),
+          if (_cameraSupported) ...[
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: _captureFromCamera,
+              icon: const Icon(Icons.photo_camera_outlined, size: 20),
+              label: const Text('Open Camera'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: AppColors.primary,
+                side: BorderSide(
+                  color: AppColors.primary.withValues(alpha: 0.5),
+                ),
+                padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 14),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+            ).animate().fadeIn(delay: 300.ms),
+          ],
           if (state.status == FilePickerStatus.error && state.errorMessage != null) ...[
             const SizedBox(height: 16),
             Text(
@@ -266,11 +316,25 @@ class _FilePickerScreenState extends State<FilePickerScreen> {
         ),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 4),
-          child: TextButton.icon(
-            onPressed: () => context.read<FilePickerCubit>().pickFiles(),
-            icon: const Icon(Icons.add, size: 18),
-            label: const Text('Add more files'),
-            style: TextButton.styleFrom(foregroundColor: AppColors.primary),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              TextButton.icon(
+                onPressed: () => context.read<FilePickerCubit>().pickFiles(),
+                icon: const Icon(Icons.add, size: 18),
+                label: const Text('Add more files'),
+                style: TextButton.styleFrom(foregroundColor: AppColors.primary),
+              ),
+              if (_cameraSupported) ...[
+                const SizedBox(width: 8),
+                TextButton.icon(
+                  onPressed: _captureFromCamera,
+                  icon: const Icon(Icons.photo_camera_outlined, size: 18),
+                  label: const Text('Camera'),
+                  style: TextButton.styleFrom(foregroundColor: AppColors.primary),
+                ),
+              ],
+            ],
           ),
         ),
       ],

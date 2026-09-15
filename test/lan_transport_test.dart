@@ -32,6 +32,20 @@ void main() {
     } catch (_) {}
   });
 
+  /// connectToDevice returns as soon as `hello` is queued; the `hello_ack`
+  /// arrives asynchronously. Wait for the handshake to complete so assertions
+  /// on the transport state are not racing the socket listener.
+  Future<void> waitForConnected(LanSocketTransport t,
+      {Duration timeout = const Duration(seconds: 5)}) async {
+    final deadline = DateTime.now().add(timeout);
+    while (t.state != TransportState.connected) {
+      if (DateTime.now().isAfter(deadline)) {
+        fail('Timed out waiting for connected state');
+      }
+      await Future.delayed(const Duration(milliseconds: 10));
+    }
+  }
+
   test('full session: negotiate, chunk, ack and verify a real file', () async {
     // Build a 2.5 MB source file so it spans several 512 KB chunks.
     final rng = Random(42);
@@ -79,7 +93,7 @@ void main() {
       address: '127.0.0.1',
       port: LanSocketTransport.servicePort,
     ));
-    expect(sender.state, TransportState.connected);
+    await waitForConnected(sender);
 
     final resume = await sender.sendSessionStart(
       'session-1',
@@ -212,7 +226,7 @@ void main() {
       address: '127.0.0.1',
       port: LanSocketTransport.servicePort,
     ));
-    expect(sender.state, TransportState.connected);
+    await waitForConnected(sender);
 
     final peer = await receiverConnected.timeout(const Duration(seconds: 5));
     expect(peer.deviceName, 'Loopback');
@@ -323,7 +337,7 @@ void main() {
       address: '127.0.0.1',
       port: LanSocketTransport.servicePort,
     ));
-    expect(sender.state, TransportState.connected);
+    await waitForConnected(sender);
 
     await sender.disconnectPeers();
 
