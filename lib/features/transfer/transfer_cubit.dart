@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:saf/saf.dart';
 import 'package:uuid/uuid.dart';
 import 'transfer_state.dart';
 import 'session/transfer_session.dart';
@@ -200,10 +201,27 @@ class TransferCubit extends Cubit<TransferState> {
         continue;
       }
 
-      final reader = ChunkedFileReader(
-        file: File(fileManifest.filePath),
-        chunkSize: chunkSize,
-      );
+      // SAF picks return `content://` URIs (no cache copy), so resolve them to
+      // a live native fd path the reader/hash can open like a plain file. The
+      // descriptor stays open for the whole file and is closed in the cleanup
+      // below.
+      SafOpenFd? contentFd;
+      String sourcePath = fileManifest.filePath;
+      final ChunkedFileReader reader;
+      try {
+        final resolved = await _resolveSourceForSend(fileManifest.filePath);
+        sourcePath = resolved.$1;
+        contentFd = resolved.$2;
+        reader = ChunkedFileReader(file: File(sourcePath), chunkSize: chunkSize);
+      } catch (e) {
+        if (contentFd != null) {
+          try {
+            await Saf().closeFileDescriptor(contentFd.fd);
+          } catch (_) {}
+        }
+        _failTransfer(e, fileManifest);
+        return;
+      }
 
       Object? failure;
       var fileOk = false;
@@ -254,7 +272,7 @@ class TransferCubit extends Cubit<TransferState> {
         if (sendError != null) {
           failure = sendError;
         } else if (!_isPaused) {
-          hash = await computeFileHash(fileManifest.filePath);
+          hash = await computeFileHash(sourcePath);
           try {
             await _transport.sendFileComplete(
               _currentFileIndex,
@@ -273,6 +291,11 @@ class TransferCubit extends Cubit<TransferState> {
         failure = e;
       } finally {
         await reader.close();
+        if (contentFd != null) {
+          try {
+            await Saf().closeFileDescriptor(contentFd.fd);
+          } catch (_) {}
+        }
       }
 
       if (failure != null) {
@@ -302,6 +325,19 @@ class TransferCubit extends Cubit<TransferState> {
       status: TransferStatus.completed,
       session: completedSession,
     ));
+  }
+
+  /// Resolves the path given to the sender into something [dart:io] can open.
+  ///
+  /// Regular files pass through unchanged. `content://` URIs (from SAF picks)
+  /// are bridged to a native fd via `/proc/self/fd/<fd>`, which the
+  /// existing [ChunkedFileReader] and [computeFileHash] can stream like any
+  /// file — no whole-file copy into app cache. The caller must close the
+  /// returned fd once the file is done.
+  Future<(String, SafOpenFd?)> _resolveSourceForSend(String filePath) async {
+    if (!filePath.startsWith('content://')) return (filePath, null);
+    final fd = await Saf().openFileDescriptor(filePath, 'r');
+    return (fd.path, fd);
   }
 
   Future<void> _sendChunkWithRetry(int fileIndex, ChunkData chunk) async {
