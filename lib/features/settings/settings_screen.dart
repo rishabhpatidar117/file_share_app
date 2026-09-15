@@ -12,8 +12,23 @@ class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
 
   static const List<int> _chunkSizeOptions = [
-    5, 20, 50, 100, 200, 512, 700, 1024, 1228, 1536, 2048, 3072,
-    5120, 10240, 15360, 20480, 30720,
+    5,
+    20,
+    50,
+    100,
+    200,
+    512,
+    700,
+    1024,
+    1228,
+    1536,
+    2048,
+    3072,
+    5120,
+    10240,
+    15360,
+    20480,
+    30720,
   ];
 
   static String _formatChunkSize(int kb) {
@@ -25,6 +40,18 @@ class SettingsScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    final cubit = context.read<SettingsCubit>();
+    final state = cubit.state;
+
+    // Clamp stale saved values to valid dropdown ranges.
+    if (!_chunkSizeOptions.contains(state.chunkSizeKB)) {
+      final nearest = _chunkSizeOptions.reduce(
+        (a, b) => (a - state.chunkSizeKB).abs() < (b - state.chunkSizeKB).abs()
+            ? a
+            : b,
+      );
+      cubit.setChunkSize(nearest);
+    }
 
     return GradientBackground(
       child: Scaffold(
@@ -113,29 +140,35 @@ class SettingsScreen extends StatelessWidget {
                         title: 'Save Location',
                         subtitle: location ?? 'Default (Downloads)',
                         isDark: isDark,
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            if (location != null)
+                        trailing: SizedBox(
+                          width: location != null ? 88 : 48,
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.end,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (location != null)
+                                IconButton(
+                                  padding: EdgeInsets.zero,
+                                  constraints: const BoxConstraints(),
+                                  tooltip: 'Reset to default',
+                                  onPressed: () => context
+                                      .read<SettingsCubit>()
+                                      .setSaveLocation(null),
+                                  icon: const Icon(Icons.restart_alt, size: 18),
+                                  color: isDark
+                                      ? AppColors.darkTextSecondary
+                                      : AppColors.textSecondary,
+                                ),
                               IconButton(
-                                tooltip: 'Reset to default',
-                                onPressed: () => context
-                                    .read<SettingsCubit>()
-                                    .setSaveLocation(null),
-                                icon: const Icon(Icons.restart_alt, size: 18),
-                                color: isDark
-                                    ? AppColors.darkTextSecondary
-                                    : AppColors.textSecondary,
-                              )
-                            else
-                              const SizedBox.shrink(),
-                            IconButton(
-                              tooltip: 'Choose folder',
-                              onPressed: () => _pickSaveLocation(context),
-                              icon: const Icon(Icons.edit_outlined, size: 18),
-                              color: AppColors.primary,
-                            ),
-                          ],
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints(),
+                                tooltip: 'Choose folder',
+                                onPressed: () => _pickSaveLocation(context),
+                                icon: const Icon(Icons.edit_outlined, size: 18),
+                                color: AppColors.primary,
+                              ),
+                            ],
+                          ),
                         ),
                       );
                     },
@@ -309,11 +342,13 @@ class _DropdownMenu<T> extends StatelessWidget {
       ),
       child: DropdownButtonHideUnderline(
         child: DropdownButton<T>(
-          value: value,
+          value: items.contains(value) ? value : items.first,
           isDense: true,
           borderRadius: BorderRadius.circular(12),
           items: items
-              .map((v) => DropdownMenuItem(value: v, child: Text(labelBuilder(v))))
+              .map(
+                (v) => DropdownMenuItem(value: v, child: Text(labelBuilder(v))),
+              )
               .toList(),
           onChanged: (v) {
             if (v != null) onChanged(v);
@@ -323,7 +358,11 @@ class _DropdownMenu<T> extends StatelessWidget {
             fontSize: 13,
             fontWeight: FontWeight.w600,
           ),
-          icon: const Icon(Icons.arrow_drop_down, color: AppColors.primary, size: 22),
+          icon: const Icon(
+            Icons.arrow_drop_down,
+            color: AppColors.primary,
+            size: 22,
+          ),
         ),
       ),
     );
