@@ -9,6 +9,9 @@ const int kSwiftShareServicePort = 48732;
 enum TransportState {
   disconnected,
   discovering,
+
+  /// Receiver is advertising on the LAN, no live peer yet.
+  listening,
   connecting,
   connected,
   transferring,
@@ -123,6 +126,12 @@ abstract class TransportChannel {
   @protected
   final StreamController<void> incomingSessionCompleteController =
       StreamController<void>.broadcast();
+  @protected
+  final StreamController<PeerConnection> peerConnectedController =
+      StreamController<PeerConnection>.broadcast();
+  @protected
+  final StreamController<String> peerDisconnectedController =
+      StreamController<String>.broadcast();
 
   Stream<DeviceInfo> get onDeviceFound => deviceFoundController.stream;
   Stream<TransportState> get onStateChanged => stateController.stream;
@@ -133,6 +142,14 @@ abstract class TransportChannel {
       incomingFileCompleteController.stream;
   Stream<void> get onIncomingSessionComplete =>
       incomingSessionCompleteController.stream;
+
+  /// A live peer link was established (either this device initiated it or the
+  /// pair completed the hello/hello_ack handshake).
+  Stream<PeerConnection> get onPeerConnected => peerConnectedController.stream;
+
+  /// A previously established peer link was torn down (disconnect, error or
+  /// socket close). Emits the peer's name.
+  Stream<String> get onPeerDisconnected => peerDisconnectedController.stream;
 
   TransportState _state = TransportState.disconnected;
   TransportState get state => _state;
@@ -179,6 +196,10 @@ abstract class TransportChannel {
   /// Notify the receiver that all files have been sent and verified.
   Future<void> sendSessionComplete(String sessionId);
 
+  /// Release the peer links (sends a disconnect frame so the peer notices too),
+  /// keeping any local listener/discovery sockets running.
+  Future<void> disconnectPeers();
+
   Future<void> disconnect();
 
   // ---- Receiver (incoming) side ----
@@ -213,7 +234,15 @@ abstract class TransportChannel {
     incomingSessionController.close();
     incomingFileCompleteController.close();
     incomingSessionCompleteController.close();
+    peerConnectedController.close();
+    peerDisconnectedController.close();
   }
+}
+
+/// A live, handshaked peer link.
+class PeerConnection {
+  final String deviceName;
+  const PeerConnection({required this.deviceName});
 }
 
 class ChunkReceivedEvent {

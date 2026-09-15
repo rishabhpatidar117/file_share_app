@@ -32,7 +32,12 @@ class LanSocketTransport extends TransportChannel {
   RawDatagramSocket? _discoverySocket;
   StreamSubscription<RawSocketEvent>? _discoverySub;
   final List<DeviceInfo> _discoveredDevices = [];
-  final Map<String, Socket> _pendingConnections = {};
+
+  /// Live peer sockets (outbound initiator + accepted incoming) with which the
+  /// hello/hello_ack handshake has completed.
+  final Set<Socket> _peerSockets = {};
+  final Map<Socket, String> _peerNames = {};
+  final Set<Socket> _pendingConnections = {};
   Timer? _beaconTimer;
   Timer? _scanTimeout;
   String _deviceName = 'My Device';
@@ -40,6 +45,7 @@ class LanSocketTransport extends TransportChannel {
 
   // Message framing buffer.
   final List<int> _receiveBuffer = [];
+  final Map<Socket, Future<void>> _writeChains = {};
   bool _listening = false;
   bool _discovering = false;
 
@@ -222,11 +228,54 @@ class LanSocketTransport extends TransportChannel {
         'name': _deviceName,
         'platform': _platformString,
       });
-      updateState(TransportState.connected);
     } catch (e) {
       updateState(TransportState.error);
       throw TransportException('Connection failed', e);
     }
+  }
+
+  /// Marks a socket as a live, handshaked peer. Emits the peer-connected signal
+  /// and moves the transport to `connected` the first time a peer link exists.
+  void _establishPeer(Socket socket, String name) {
+    final firstPeer = _peerSockets.isEmpty;
+    _peerSockets.add(socket);
+    _peerNames[socket] = name;
+    _pendingConnections.remove(socket);
+    _remoteDeviceName = name;
+    if (firstPeer) {
+      updateState(TransportState.connected);
+      peerConnectedController.add(PeerConnection(deviceName: name));
+    } else if (state != TransportState.connected) {
+      updateState(TransportState.connected);
+    }
+  }
+
+  /// Removes a socket from all peer bookkeeping. Emits the peer-disconnected
+  /// signal and drops back to `listening`/`disconnected` when the last peer
+  /// link is gone.
+  void _removePeer(Socket socket) {
+    final wasPeer = _peerSockets.remove(socket);
+    _peerNames.remove(socket);
+    _pendingConnections.remove(socket);
+    _writeChains.remove(socket);
+    if (identical(socket, _connectedSocket)) _connectedSocket = null;
+    if (identical(socket, _incomingSocket)) _incomingSocket = null;
+    if (!wasPeer) return;
+    if (_peerSockets.isEmpty) {
+      if (_peerNames.isNotEmpty) _peerNames.clear();
+      peerDisconnectedController.add(_remoteDeviceName);
+      updateState(_listening ? TransportState.listening : TransportState.disconnected);
+    }
+  }
+
+  Future<void> _closePeerSocket(Socket socket) async {
+    try {
+      await _sendMessage(socket, {'type': 'disconnect'});
+    } catch (_) {}
+    try {
+      socket.close();
+    } catch (_) {}
+    _removePeer(socket);
   }
 
   @override
@@ -261,9 +310,8 @@ class LanSocketTransport extends TransportChannel {
   }
 
   void _handleIncomingConnection(Socket socket) {
-    final remoteAddress = socket.remoteAddress.address;
-    _pendingConnections[remoteAddress] = socket;
-    socket.done.then((_) => _pendingConnections.remove(remoteAddress));
+    _pendingConnections.add(socket);
+    socket.done.then((_) => _removePeer(socket));
     _setupDataListener(socket);
     _sendMessage(socket, {
       'type': 'hello_ack',
@@ -278,17 +326,20 @@ class LanSocketTransport extends TransportChannel {
         _receiveBuffer.addAll(data);
         _processBuffer(socket);
       },
-      onError: (_) {
-        if (identical(socket, _connectedSocket)) {
-          updateState(TransportState.error);
-        }
-      },
-      onDone: () {
-        if (identical(socket, _connectedSocket)) {
-          updateState(TransportState.disconnected);
-        }
-      },
+      onError: (_) => _handleSocketClosed(socket),
+      onDone: () => _handleSocketClosed(socket),
     );
+  }
+
+  void _handleSocketClosed(Socket socket) {
+    final wasPeer = _peerSockets.contains(socket);
+    if (identical(socket, _connectedSocket) && !wasPeer) {
+      // Connection dropped before the hello/hello_ack handshake completed.
+      _connectedSocket = null;
+      updateState(TransportState.disconnected);
+      return;
+    }
+    _removePeer(socket);
   }
 
   // ---------------------------------------------------------------------------
@@ -322,7 +373,7 @@ class LanSocketTransport extends TransportChannel {
 
     switch (type) {
       case 'hello':
-        _remoteDeviceName = message['name'] ?? 'Unknown';
+        _establishPeer(socket, message['name'] as String? ?? 'Unknown');
         _sendMessage(socket, {
           'type': 'hello_ack',
           'name': _deviceName,
@@ -331,10 +382,11 @@ class LanSocketTransport extends TransportChannel {
         break;
 
       case 'hello_ack':
-        _remoteDeviceName = message['name'] ?? _remoteDeviceName;
-        if (state == TransportState.connecting) {
-          updateState(TransportState.connected);
-        }
+        _establishPeer(socket, message['name'] as String? ?? 'Unknown');
+        break;
+
+      case 'disconnect':
+        _closePeerSocket(socket);
         break;
 
       case 'session_start':
@@ -422,13 +474,32 @@ class LanSocketTransport extends TransportChannel {
     final frame = Uint8List(4 + bytes.length);
     ByteData.sublistView(frame).setUint32(0, bytes.length);
     frame.setRange(4, frame.length, bytes);
-    socket.add(frame);
-    await socket.flush();
+
+    // dart:io sockets only allow one un-flushed add() at a time
+    // (io_sink's flush() binds the sink), so serialize writes per socket.
+    final previous = _writeChains[socket] ?? Future<void>.value();
+    final next = previous
+        .catchError((_) {})
+        .then((_) async {
+          socket.add(frame);
+          await socket.flush();
+        });
+    _writeChains[socket] = next;
+    return next;
   }
 
   // ---------------------------------------------------------------------------
   // Sender API
   // ---------------------------------------------------------------------------
+
+  /// The socket used to push our outgoing sessions. Prefers the socket this
+  /// device initiated; otherwise falls back to a peer socket we accepted, so a
+  /// receiver can send files back across the same established link.
+  Socket get _senderSocket {
+    if (_connectedSocket != null) return _connectedSocket!;
+    if (_peerSockets.isNotEmpty) return _peerSockets.first;
+    throw TransportException('Not connected to any device');
+  }
 
   @override
   Future<ResumePoints> sendSessionStart(
@@ -437,10 +508,7 @@ class LanSocketTransport extends TransportChannel {
     List<SessionFileMeta> files, {
     int? chunkSize,
   }) async {
-    final socket = _connectedSocket;
-    if (socket == null) {
-      throw TransportException('Not connected to any device');
-    }
+    final socket = _senderSocket;
     final completer = Completer<ResumePoints>();
     _sessionStartWaiter = completer;
     await _sendMessage(socket, {
@@ -458,8 +526,7 @@ class LanSocketTransport extends TransportChannel {
 
   @override
   Future<void> sendChunk(int fileIndex, ChunkMetadata metadata, Uint8List data) async {
-    final socket = _connectedSocket;
-    if (socket == null) throw TransportException('Not connected');
+    final socket = _senderSocket;
     updateState(TransportState.transferring);
 
     final key = _chunkKey(fileIndex, metadata.index);
@@ -488,8 +555,7 @@ class LanSocketTransport extends TransportChannel {
     int fileSize = 0,
     int totalChunks = 0,
   }) async {
-    final socket = _connectedSocket;
-    if (socket == null) throw TransportException('Not connected');
+    final socket = _senderSocket;
     final completer = Completer<void>();
     _fileAckWaiters[fileIndex] = completer;
     await _sendMessage(socket, {
@@ -509,8 +575,7 @@ class LanSocketTransport extends TransportChannel {
 
   @override
   Future<void> sendSessionComplete(String sessionId) async {
-    final socket = _connectedSocket;
-    if (socket == null) return;
+    final socket = _senderSocket;
     await _sendMessage(socket, {
       'type': 'session_complete',
       'sessionId': sessionId,
@@ -585,21 +650,44 @@ class LanSocketTransport extends TransportChannel {
 
   @override
   void resume() {
-    updateState(TransportState.connected);
+    if (_peerSockets.isNotEmpty) {
+      updateState(TransportState.connected);
+    }
+  }
+
+  @override
+  Future<void> disconnectPeers() async {
+    final sockets = List<Socket>.from(_peerSockets);
+    for (final s in sockets) {
+      await _closePeerSocket(s);
+    }
+    _connectedSocket = null;
+    _incomingSocket = null;
+    _activeIncomingSessionId = null;
+    _sessionStartWaiter = null;
+    if (state != TransportState.disconnected && state != TransportState.connecting) {
+      updateState(_listening ? TransportState.listening : TransportState.disconnected);
+    }
   }
 
   @override
   Future<void> disconnect() async {
     final sockets = <Socket>{};
     if (_connectedSocket != null) sockets.add(_connectedSocket!);
-    sockets.addAll(_pendingConnections.values);
+    sockets.addAll(_pendingConnections);
+    sockets.addAll(_peerSockets);
     for (final s in sockets) {
+      try {
+        await _sendMessage(s, {'type': 'disconnect'});
+      } catch (_) {}
       try {
         s.close();
       } catch (_) {}
     }
     _connectedSocket = null;
     _pendingConnections.clear();
+    _peerSockets.clear();
+    _peerNames.clear();
     _incomingSocket = null;
     _activeIncomingSessionId = null;
     await stopIncoming();

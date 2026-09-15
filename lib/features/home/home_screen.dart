@@ -36,6 +36,11 @@ class _HomeScreenState extends State<HomeScreen> {
     return _buildMobileLayout(context, isDark);
   }
 
+  Color get _selectedColor =>
+      Theme.of(context).brightness == Brightness.dark
+          ? AppColors.primaryLight
+          : AppColors.primary;
+
   Widget _buildWideLayout(BuildContext context, bool isDark) {
     return Scaffold(
       body: Row(
@@ -46,18 +51,26 @@ class _HomeScreenState extends State<HomeScreen> {
             backgroundColor: isDark
                 ? AppColors.darkBackground
                 : AppColors.lightBackground,
-            indicatorColor: AppColors.primary.withValues(alpha: 0.15),
-            selectedIconTheme: IconThemeData(color: AppColors.primary),
+            indicatorColor: _selectedColor.withValues(alpha: 0.18),
+            selectedIconTheme: IconThemeData(color: _selectedColor),
             unselectedIconTheme: IconThemeData(
-              color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+              color: isDark
+                  ? AppColors.darkTextSecondary
+                  : AppColors.textSecondary,
             ),
-            selectedLabelTextStyle: TextStyle(color: AppColors.primary),
+            selectedLabelTextStyle: TextStyle(color: _selectedColor),
             unselectedLabelTextStyle: TextStyle(
-              color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+              color: isDark
+                  ? AppColors.darkTextSecondary
+                  : AppColors.textSecondary,
             ),
             leading: Padding(
               padding: const EdgeInsets.symmetric(vertical: 20),
-              child: Icon(Icons.send_rounded, color: AppColors.primary, size: 28),
+              child: Icon(
+                Icons.send_rounded,
+                color: AppColors.primary,
+                size: 28,
+              ),
             ),
             labelType: NavigationRailLabelType.all,
             destinations: const [
@@ -148,7 +161,10 @@ class _HomeContent extends StatelessWidget {
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Text('SwiftShare', style: AppTextStyles.heading1(isDark: isDark)),
+                  Text(
+                    'SwiftShare',
+                    style: AppTextStyles.heading1(isDark: isDark),
+                  ),
                   IconButton(
                     onPressed: () {
                       Navigator.push(
@@ -160,7 +176,9 @@ class _HomeContent extends StatelessWidget {
                     },
                     icon: Icon(
                       Icons.settings_outlined,
-                      color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+                      color: isDark
+                          ? AppColors.darkTextSecondary
+                          : AppColors.textSecondary,
                     ),
                   ),
                 ],
@@ -205,7 +223,10 @@ class _HomeContent extends StatelessWidget {
                 ].animate(interval: 100.ms).fadeIn().slideY(begin: 0.1),
               ),
               const SizedBox(height: 24),
-              Text('Recent Transfers', style: AppTextStyles.heading3(isDark: isDark)),
+              Text(
+                'Recent Transfers',
+                style: AppTextStyles.heading3(isDark: isDark),
+              ),
               const SizedBox(height: 12),
               const _RecentTransfers(),
             ],
@@ -255,8 +276,11 @@ class _RecentTransfersState extends State<_RecentTransfers> {
               children: [
                 Icon(
                   Icons.history_toggle_off,
-                  color: (isDark ? AppColors.darkTextSecondary : AppColors.textSecondary)
-                      .withValues(alpha: 0.5),
+                  color:
+                      (isDark
+                              ? AppColors.darkTextSecondary
+                              : AppColors.textSecondary)
+                          .withValues(alpha: 0.5),
                   size: 22,
                 ),
                 const SizedBox(width: 12),
@@ -289,7 +313,8 @@ class _RecentTransfersState extends State<_RecentTransfers> {
   }
 
   void _open(BuildContext context, TransferSession session) {
-    final completed = session.status == SessionStatus.completed && session.isCompleted;
+    final completed =
+        session.status == SessionStatus.completed && session.isCompleted;
     if (session.isSender && !completed) {
       context.read<TransferCubit>().resumeSession(session.id);
       Navigator.push(
@@ -368,7 +393,11 @@ class _RecentCard extends StatelessWidget {
               if (completed)
                 Icon(Icons.check_circle, color: AppColors.success, size: 20)
               else if (session.isSender)
-                Icon(Icons.play_circle_outline, color: AppColors.success, size: 20),
+                Icon(
+                  Icons.play_circle_outline,
+                  color: AppColors.success,
+                  size: 20,
+                ),
             ],
           ),
         ),
@@ -386,7 +415,9 @@ class _RecentCard extends StatelessWidget {
   IconData get _statusIcon {
     if (session.isCompleted) return Icons.check_circle_outline;
     if (session.hasFailed) return Icons.error_outline;
-    if (session.status == SessionStatus.paused) return Icons.pause_circle_outline;
+    if (session.status == SessionStatus.paused) {
+      return Icons.pause_circle_outline;
+    }
     return Icons.sync;
   }
 
@@ -464,14 +495,19 @@ class _ActionCard extends StatelessWidget {
                   children: [
                     Text(title, style: AppTextStyles.heading3(isDark: isDark)),
                     const SizedBox(height: 4),
-                    Text(subtitle, style: AppTextStyles.bodySmall(isDark: isDark)),
+                    Text(
+                      subtitle,
+                      style: AppTextStyles.bodySmall(isDark: isDark),
+                    ),
                   ],
                 ),
               ),
               Icon(
                 Icons.arrow_forward_ios,
                 size: 16,
-                color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+                color: isDark
+                    ? AppColors.darkTextSecondary
+                    : AppColors.textSecondary,
               ),
             ],
           ),

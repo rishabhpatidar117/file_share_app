@@ -201,4 +201,136 @@ void main() {
     final resume = await ackFuture.timeout(const Duration(seconds: 10));
     expect(resume, {0: 1});
   });
+
+  test('both ends know they are connected after the handshake', () async {
+    sender.setDeviceName('Loopback');
+    final receiverConnected = receiver.onPeerConnected.first;
+
+    await sender.connectToDevice(const DeviceInfo(
+      id: 'loopback',
+      name: 'Loopback',
+      address: '127.0.0.1',
+      port: LanSocketTransport.servicePort,
+    ));
+    expect(sender.state, TransportState.connected);
+
+    final peer = await receiverConnected.timeout(const Duration(seconds: 5));
+    expect(peer.deviceName, 'Loopback');
+    expect(receiver.state, TransportState.connected);
+  });
+
+  test('bidirectional transfer over a single established connection', () async {
+    // A -> B
+    final dataA = Uint8List.fromList(
+      List<int>.generate(250000, (i) => i % 251),
+    );
+    // B -> A (sent back over the same accepted socket)
+    final dataB = Uint8List.fromList(
+      List<int>.generate(180000, (i) => i % 127),
+    );
+    final fileA = '${sandbox.path}/from_a.bin';
+    final fileB = '${sandbox.path}/from_b.bin';
+    await File(fileA).writeAsBytes(dataA);
+    await File(fileB).writeAsBytes(dataB);
+    final hashA = await computeFileHash(fileA);
+    final hashB = await computeFileHash(fileB);
+    final readerA = ChunkedFileReader(file: File(fileA));
+    final readerB = ChunkedFileReader(file: File(fileB));
+
+    final receivedByReceiver = <Uint8List>[];
+    final receivedBySender = <Uint8List>[];
+
+    // Receiver side (B) handles A's incoming session.
+    receiver.onIncomingSession.listen((session) async {
+      expect(session.remoteDeviceName, 'DeviceA');
+      await receiver.acceptIncoming(session.sessionId, {});
+    });
+    receiver.onChunkReceived.listen((event) async {
+      receivedByReceiver.add(event.data);
+      await receiver.sendChunkAck(event.fileIndex, event.metadata.index);
+    });
+    receiver.onIncomingFileComplete.listen((event) async {
+      expect(event.sha256, hashA);
+      await receiver.sendFileCompleteAck(event.fileIndex);
+    });
+
+    // Sender side (A) also handles B's reverse session over the same socket.
+    sender.onIncomingSession.listen((session) async {
+      expect(session.remoteDeviceName, 'DeviceB');
+      await sender.acceptIncoming(session.sessionId, {});
+    });
+    sender.onChunkReceived.listen((event) async {
+      receivedBySender.add(event.data);
+      await sender.sendChunkAck(event.fileIndex, event.metadata.index);
+    });
+    sender.onIncomingFileComplete.listen((event) async {
+      expect(event.sha256, hashB);
+      await sender.sendFileCompleteAck(event.fileIndex);
+    });
+
+    await sender.connectToDevice(const DeviceInfo(
+      id: 'loopback',
+      name: 'Loopback',
+      address: '127.0.0.1',
+      port: LanSocketTransport.servicePort,
+    ));
+
+    // A -> B.
+    await sender.sendSessionStart(
+      'duplex-a',
+      'DeviceA',
+      const [
+        SessionFileMeta(index: 0, fileName: 'from_a.bin', fileSize: 250000, totalChunks: 1),
+      ],
+    );
+    final chunkA = await readerA.readChunk(0);
+    await sender.sendChunk(0, chunkA.metadata, chunkA.bytes);
+    await sender.sendFileComplete(0, hashA,
+        fileName: 'from_a.bin', fileSize: readerA.totalSize, totalChunks: 1);
+
+    // B -> A over the same link A opened.
+    await receiver.sendSessionStart(
+      'duplex-b',
+      'DeviceB',
+      const [
+        SessionFileMeta(index: 0, fileName: 'from_b.bin', fileSize: 180000, totalChunks: 1),
+      ],
+    );
+    final chunkB = await readerB.readChunk(0);
+    await receiver.sendChunk(0, chunkB.metadata, chunkB.bytes);
+    await receiver.sendFileComplete(0, hashB,
+        fileName: 'from_b.bin', fileSize: readerB.totalSize, totalChunks: 1);
+
+    final bytesToB = <int>[];
+    for (final p in receivedByReceiver) {
+      bytesToB.addAll(p);
+    }
+    final bytesToA = <int>[];
+    for (final p in receivedBySender) {
+      bytesToA.addAll(p);
+    }
+    expect(bytesToB, dataA);
+    expect(bytesToA, dataB);
+  });
+
+  test('disconnect tears the link down on both ends', () async {
+    sender.setDeviceName('Loopback');
+    final peerGone = receiver.onPeerDisconnected.first;
+
+    await sender.connectToDevice(const DeviceInfo(
+      id: 'loopback',
+      name: 'Loopback',
+      address: '127.0.0.1',
+      port: LanSocketTransport.servicePort,
+    ));
+    expect(sender.state, TransportState.connected);
+
+    await sender.disconnectPeers();
+
+    final gone = await peerGone.timeout(const Duration(seconds: 5));
+    expect(gone, 'Loopback');
+    // Sender has no local server running; the receiver keeps listening.
+    expect(sender.state, TransportState.disconnected);
+    expect(receiver.state, TransportState.listening);
+  });
 }

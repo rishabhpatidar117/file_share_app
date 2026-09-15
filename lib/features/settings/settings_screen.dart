@@ -35,7 +35,21 @@ class SettingsScreen extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('Settings', style: AppTextStyles.heading1(isDark: isDark)),
+                Row(
+                  children: [
+                    if (Navigator.canPop(context)) ...[
+                      IconButton(
+                        onPressed: () => Navigator.pop(context),
+                        icon: const Icon(Icons.arrow_back_ios_new),
+                      ),
+                      const SizedBox(width: 8),
+                    ],
+                    Text(
+                      'Settings',
+                      style: AppTextStyles.heading1(isDark: isDark),
+                    ),
+                  ],
+                ),
                 const SizedBox(height: 24),
                 _buildSection('Appearance', isDark, [
                   BlocBuilder<SettingsCubit, SettingsState>(

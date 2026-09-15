@@ -8,9 +8,16 @@ class DiscoveryCubit extends Cubit<DiscoveryState> {
   final TransportChannel _transport;
   StreamSubscription? _deviceSub;
   StreamSubscription? _stateSub;
+  StreamSubscription? _peerConnectedSub;
+  StreamSubscription? _peerDisconnectedSub;
+  bool _receiverMode = false;
 
   DiscoveryCubit(this._transport) : super(const DiscoveryState()) {
     _deviceSub = _transport.onDeviceFound.listen((device) {
+      if (state.status == DiscoveryStatus.connecting ||
+          state.status == DiscoveryStatus.connected) {
+        return;
+      }
       final devices = List<DeviceInfo>.from(state.devices);
       if (!devices.any((d) => d.id == device.id)) {
         devices.add(device);
@@ -30,21 +37,54 @@ class DiscoveryCubit extends Cubit<DiscoveryState> {
           emit(state.copyWith(status: DiscoveryStatus.connecting));
           break;
         case TransportState.connected:
-          emit(state.copyWith(status: DiscoveryStatus.connected));
+          if (state.status != DiscoveryStatus.connected) {
+            emit(state.copyWith(status: DiscoveryStatus.connected));
+          }
+          break;
+        case TransportState.disconnected:
+          emit(state.copyWith(
+            status: _receiverMode
+                ? DiscoveryStatus.listening
+                : DiscoveryStatus.searching,
+            clearError: true,
+          ));
+          break;
+        case TransportState.listening:
+          emit(state.copyWith(status: DiscoveryStatus.listening));
           break;
         case TransportState.error:
           emit(state.copyWith(
             status: DiscoveryStatus.error,
-            errorMessage: 'Connection failed',
+            errorMessage: state.errorMessage ?? 'Connection failed',
           ));
           break;
         default:
           break;
       }
     });
+
+    _peerConnectedSub = _transport.onPeerConnected.listen((peer) {
+      emit(state.copyWith(
+        status: DiscoveryStatus.connected,
+        connectedPeer: peer.deviceName,
+        clearError: true,
+      ));
+    });
+
+    _peerDisconnectedSub = _transport.onPeerDisconnected.listen((name) {
+      emit(state.copyWith(
+        connectedPeer: null,
+        status: _receiverMode
+            ? DiscoveryStatus.listening
+            : DiscoveryStatus.searching,
+        clearError: true,
+      ));
+    });
   }
 
+  /// Start scanning for devices so this device can initiate a transfer.
   Future<void> startDiscovery() async {
+    _receiverMode = false;
     emit(state.copyWith(
       status: DiscoveryStatus.searching,
       devices: [],
@@ -66,14 +106,18 @@ class DiscoveryCubit extends Cubit<DiscoveryState> {
 
   /// Bind a listener so remote devices can start an incoming transfer.
   Future<void> startReceive() async {
+    _receiverMode = true;
     emit(state.copyWith(
-      status: DiscoveryStatus.searching,
+      status: DiscoveryStatus.listening,
       devices: [],
       clearError: true,
     ));
     try {
       await _transport.startIncoming();
-      emit(state.copyWith(status: DiscoveryStatus.connected, clearError: true));
+      emit(state.copyWith(
+        status: DiscoveryStatus.listening,
+        clearError: true,
+      ));
     } catch (e) {
       emit(state.copyWith(
         status: DiscoveryStatus.error,
@@ -85,8 +129,12 @@ class DiscoveryCubit extends Cubit<DiscoveryState> {
   Future<void> stopListening() async {
     await _transport.stopIncoming();
     if (state.status == DiscoveryStatus.connected ||
+        state.status == DiscoveryStatus.listening ||
         state.status == DiscoveryStatus.searching) {
-      emit(state.copyWith(status: DiscoveryStatus.initial));
+      emit(state.copyWith(
+        status: DiscoveryStatus.initial,
+        connectedPeer: null,
+      ));
     }
   }
 
@@ -94,6 +142,7 @@ class DiscoveryCubit extends Cubit<DiscoveryState> {
     emit(state.copyWith(
       status: DiscoveryStatus.connecting,
       selectedDevice: device,
+      clearError: true,
     ));
     try {
       await _transport.connectToDevice(device);
@@ -108,6 +157,19 @@ class DiscoveryCubit extends Cubit<DiscoveryState> {
     }
   }
 
+  /// Tear down the current peer link; both devices return to a listening /
+  /// scanning state and can link again.
+  Future<void> disconnectPeer() async {
+    await _transport.disconnectPeers();
+    emit(state.copyWith(
+      status: _receiverMode
+          ? DiscoveryStatus.listening
+          : DiscoveryStatus.searching,
+      connectedPeer: null,
+      clearError: true,
+    ));
+  }
+
   void reset() {
     emit(const DiscoveryState());
   }
@@ -116,6 +178,8 @@ class DiscoveryCubit extends Cubit<DiscoveryState> {
   Future<void> close() {
     _deviceSub?.cancel();
     _stateSub?.cancel();
+    _peerConnectedSub?.cancel();
+    _peerDisconnectedSub?.cancel();
     return super.close();
   }
 }

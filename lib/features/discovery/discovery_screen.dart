@@ -60,6 +60,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     } else {
       _cubit.stopListening();
     }
+    _cubit.disconnectPeer();
     super.dispose();
   }
 
@@ -114,9 +115,15 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
               const SizedBox(height: 8),
               if (widget.initialFilePaths.isNotEmpty)
                 _buildSharedFilesBanner(isDark),
-              if (widget.isSender)
-                BlocBuilder<DiscoveryCubit, DiscoveryState>(
-                  builder: (context, state) {
+              BlocBuilder<DiscoveryCubit, DiscoveryState>(
+                builder: (context, state) {
+                  if (state.status == DiscoveryStatus.connected) {
+                    return _buildConnectedCard(state.connectedPeer, isDark);
+                  }
+                  if (state.status == DiscoveryStatus.error) {
+                    return _buildErrorState(state.errorMessage, isDark);
+                  }
+                  if (widget.isSender) {
                     if (state.status == DiscoveryStatus.searching) {
                       return _buildSearchingIndicator(isDark);
                     }
@@ -126,21 +133,11 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                         isDark,
                       );
                     }
-                    if (state.status == DiscoveryStatus.error) {
-                      return _buildErrorState(state.errorMessage, isDark);
-                    }
                     return const SizedBox.shrink();
-                  },
-                )
-              else
-                BlocBuilder<DiscoveryCubit, DiscoveryState>(
-                  builder: (context, state) {
-                    if (state.status == DiscoveryStatus.error) {
-                      return _buildErrorState(state.errorMessage, isDark);
-                    }
-                    return _buildListeningIndicator(isDark);
-                  },
-                ),
+                  }
+                  return _buildListeningIndicator(isDark);
+                },
+              ),
               Expanded(
                 child: widget.isSender
                     ? _buildDeviceList(isDark)
@@ -221,13 +218,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     final connected = await _cubit.connectToDevice(result);
     if (!mounted) return;
     if (connected) {
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) =>
-              FilePickerScreen(initialPaths: widget.initialFilePaths),
-        ),
-      );
+      GlassToast.show(context, 'Connected to ${result.name}');
     }
   }
 
@@ -240,13 +231,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     final connected = await _cubit.connectToDevice(result);
     if (!mounted) return;
     if (connected) {
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) =>
-              FilePickerScreen(initialPaths: widget.initialFilePaths),
-        ),
-      );
+      GlassToast.show(context, 'Connected to ${result.name}');
     }
   }
 
@@ -283,6 +268,108 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     );
   }
 
+Widget _buildConnectedCard(String? peerName, bool isDark) {
+    final count = widget.initialFilePaths.length;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 4),
+      child: GlassCard(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: AppColors.success.withValues(alpha: 0.12),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(
+                    Icons.check,
+                    color: AppColors.success,
+                    size: 18,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Connected to ${peerName ?? "device"}',
+                        style: AppTextStyles.heading3(isDark: isDark),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'You can now send or receive files',
+                        style: AppTextStyles.bodySmall(isDark: isDark),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: _openSendFiles,
+                    icon: const Icon(Icons.send_rounded, size: 18),
+                    label: Text(
+                      count > 0 ? 'Send $count file(s)' : 'Send Files',
+                    ),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: AppColors.primary,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () async {
+                      await _cubit.disconnectPeer();
+                      if (!mounted) return;
+                      GlassToast.show(context, 'Disconnected');
+                    },
+                    icon: const Icon(Icons.link_off, size: 18),
+                    label: const Text('Disconnect'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppColors.error,
+                      side: BorderSide(
+                        color: AppColors.error.withValues(alpha: 0.5),
+                      ),
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _openSendFiles() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => FilePickerScreen(initialPaths: widget.initialFilePaths),
+      ),
+    );
+  }
+
   Widget _buildDeviceList(bool isDark) {
     return BlocBuilder<DiscoveryCubit, DiscoveryState>(
       builder: (context, state) {
@@ -304,14 +391,11 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                           final connected = await _cubit.connectToDevice(
                             device,
                           );
-                          if (!mounted || !connected) return;
-                          Navigator.push(
-                            this.context,
-                            MaterialPageRoute(
-                              builder: (_) => FilePickerScreen(
-                                initialPaths: widget.initialFilePaths,
-                              ),
-                            ),
+                          if (!connected) return;
+                          if (!context.mounted) return;
+                          GlassToast.show(
+                            context,
+                            'Connected to ${device.name}',
                           );
                         },
                       )

@@ -58,6 +58,12 @@ class NearbyTransport extends TransportChannel {
   }
 
   @override
+  Future<void> disconnectPeers() async {
+    // Stub transport mirrors disconnect semantics.
+    updateState(TransportState.disconnected);
+  }
+
+  @override
   Future<void> sendChunk(int fileIndex, ChunkMetadata metadata, Uint8List data) async {
     if (state == TransportState.paused) return;
     updateState(TransportState.transferring);

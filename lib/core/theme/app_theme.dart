@@ -27,6 +27,11 @@ class AppTheme {
         overlayColor: WidgetStateProperty.all(Colors.transparent),
         surfaceTintColor: Colors.transparent,
         height: 64,
+        iconTheme: WidgetStateProperty.resolveWith((states) => IconThemeData(
+          color: states.contains(WidgetState.selected)
+              ? AppColors.primary
+              : AppColors.textSecondary,
+        )),
         labelTextStyle: WidgetStateProperty.resolveWith((states) {
           final isSelected = states.contains(WidgetState.selected);
           return TextStyle(
@@ -88,6 +93,11 @@ class AppTheme {
         overlayColor: WidgetStateProperty.all(Colors.transparent),
         surfaceTintColor: Colors.transparent,
         height: 64,
+        iconTheme: WidgetStateProperty.resolveWith((states) => IconThemeData(
+          color: states.contains(WidgetState.selected)
+              ? AppColors.primaryLight
+              : AppColors.darkTextSecondary,
+        )),
         labelTextStyle: WidgetStateProperty.resolveWith((states) {
           final isSelected = states.contains(WidgetState.selected);
           return TextStyle(
