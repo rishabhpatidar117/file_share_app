@@ -3,6 +3,7 @@ import 'package:hive/hive.dart';
 import 'package:window_manager/window_manager.dart';
 import '../services/notification_service.dart';
 import '../services/permission_service.dart';
+import '../services/share_receiver_service.dart';
 import '../utils/device_name.dart';
 import '../../features/discovery/discovery_cubit.dart';
 import '../../features/transfer/transfer_cubit.dart';
@@ -29,6 +30,10 @@ Future<void> initServiceLocator() async {
   await notifications.initialize();
 
   getIt.registerLazySingleton(() => PermissionService(notifications));
+
+  final shareReceiver = ShareReceiverService();
+  getIt.registerLazySingleton(() => shareReceiver);
+  await shareReceiver.initialize();
 
   final String deviceName =
       settingsBox.get('deviceName', defaultValue: await DeviceName.resolve()) as String;

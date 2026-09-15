@@ -25,7 +25,15 @@ import '../file_picker/file_picker_screen.dart';
 class DiscoveryScreen extends StatefulWidget {
   final bool isSender;
 
-  const DiscoveryScreen({super.key, this.isSender = true});
+  /// Files captured from the system share sheet (or any pre-picked paths) that
+  /// should be preloaded into the file picker once a device is connected.
+  final List<String> initialFilePaths;
+
+  const DiscoveryScreen({
+    super.key,
+    this.isSender = true,
+    this.initialFilePaths = const [],
+  });
 
   @override
   State<DiscoveryScreen> createState() => _DiscoveryScreenState();
@@ -104,6 +112,8 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                 ),
               ),
               const SizedBox(height: 8),
+              if (widget.initialFilePaths.isNotEmpty)
+                _buildSharedFilesBanner(isDark),
               if (widget.isSender)
                 BlocBuilder<DiscoveryCubit, DiscoveryState>(
                   builder: (context, state) {
@@ -210,11 +220,15 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     if (result == null || !mounted) return;
     final connected = await _cubit.connectToDevice(result);
     if (!mounted) return;
-    if (!connected) return;
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => const FilePickerScreen()),
-    );
+    if (connected) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) =>
+              FilePickerScreen(initialPaths: widget.initialFilePaths),
+        ),
+      );
+    }
   }
 
   Future<void> _promptScanQrCode() async {
@@ -225,10 +239,47 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     if (result == null || !mounted) return;
     final connected = await _cubit.connectToDevice(result);
     if (!mounted) return;
-    if (!connected) return;
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => const FilePickerScreen()),
+    if (connected) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) =>
+              FilePickerScreen(initialPaths: widget.initialFilePaths),
+        ),
+      );
+    }
+  }
+
+  Widget _buildSharedFilesBanner(bool isDark) {
+    final count = widget.initialFilePaths.length;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 4),
+      child: GlassCard(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(6),
+              decoration: BoxDecoration(
+                color: AppColors.primary.withValues(alpha: 0.12),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(
+                Icons.ios_share,
+                color: AppColors.primary,
+                size: 16,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                '$count file(s) ready to send - pick a device to continue',
+                style: AppTextStyles.bodySmall(isDark: isDark),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -257,7 +308,9 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                           Navigator.push(
                             this.context,
                             MaterialPageRoute(
-                              builder: (_) => const FilePickerScreen(),
+                              builder: (_) => FilePickerScreen(
+                                initialPaths: widget.initialFilePaths,
+                              ),
                             ),
                           );
                         },

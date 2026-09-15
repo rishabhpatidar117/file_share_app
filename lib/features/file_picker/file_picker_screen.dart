@@ -11,8 +11,29 @@ import '../../core/widgets/gradient_background.dart';
 import '../transfer/transfer_cubit.dart';
 import '../transfer/transfer_screen.dart';
 
-class FilePickerScreen extends StatelessWidget {
-  const FilePickerScreen({super.key});
+class FilePickerScreen extends StatefulWidget {
+  /// Existing file paths to preload, e.g. files captured from the system share
+  /// sheet. When provided the send flow starts with these files selected.
+  final List<String> initialPaths;
+
+  const FilePickerScreen({super.key, this.initialPaths = const []});
+
+  @override
+  State<FilePickerScreen> createState() => _FilePickerScreenState();
+}
+
+class _FilePickerScreenState extends State<FilePickerScreen> {
+  @override
+  void initState() {
+    super.initState();
+    if (widget.initialPaths.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        final cubit = context.read<FilePickerCubit>();
+        cubit.pickFilesFromPath(widget.initialPaths);
+      });
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
