@@ -75,18 +75,22 @@ class ShareReceiverService {
     );
   }
 
-  /// Copies a shared file (staged by the share handler into its own cache) into
-  /// a dedicated SwiftShare folder so it stays readable during the transfer.
+  /// Resolves a shared file to a local path the transport can stream from.
+  ///
+  /// The Android share handler already stages `content://` URIs into its own
+  /// cache and exposes absolute paths, so for multi-GB files we reuse that path
+  /// directly instead of copying the whole file (which would stall the UI and
+  /// double disk usage). A full copy is only made as a fallback for paths that
+  /// dart:io cannot open.
   Future<String?> _stageFile(String sourcePath, int index) async {
     try {
-      final dir = await _shareDir();
       final source = File(sourcePath);
-      if (!await source.exists()) return null;
+      if (await source.exists()) return source.path;
 
+      final dir = await _shareDir();
       final base = sourcePath.split(Platform.pathSeparator).last;
       final name = base.isEmpty ? 'shared_item_$index' : base;
       final target = File('${dir.path}/$name');
-      if (target.path == source.path) return target.path;
       if (await target.exists()) await target.delete();
       await source.copy(target.path);
       return target.path;

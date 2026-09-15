@@ -34,6 +34,7 @@ class TransferFileManifest {
 
   TransferFileManifest copyWith({
     FileTransferStatus? status,
+    String? filePath,
     int? chunksSent,
     int? totalChunks,
     int? lastAckedChunk,
@@ -41,7 +42,7 @@ class TransferFileManifest {
   }) {
     return TransferFileManifest(
       fileName: fileName,
-      filePath: filePath,
+      filePath: filePath ?? this.filePath,
       fileSize: fileSize,
       expectedHash: expectedHash,
       status: status ?? this.status,

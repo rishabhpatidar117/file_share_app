@@ -1,18 +1,20 @@
-import 'dart:io';
-
+import 'package:file_picker/file_picker.dart' as fp;
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:get_it/get_it.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text_styles.dart';
 import '../../core/utils/byte_formatter.dart';
 import '../../core/utils/file_categorizer.dart';
+import '../../core/utils/file_locator.dart';
 import '../../core/utils/file_opener.dart';
 import '../../core/widgets/glass_card.dart';
-import '../../core/widgets/glass_toast.dart';
 import '../../core/widgets/gradient_background.dart';
 import '../transfer/transfer_cubit.dart';
 import '../transfer/transfer_screen.dart';
+import '../transfer/session/session_repository.dart';
 import '../transfer/session/transfer_session.dart';
+import '../settings/settings_cubit.dart';
 
 class SessionDetailScreen extends StatelessWidget {
   final TransferSession session;
@@ -93,7 +95,7 @@ class SessionDetailScreen extends StatelessWidget {
                               isDark: isDark,
                               onOpen: session.files[i].status ==
                                       FileTransferStatus.completed
-                                  ? () => _openFile(context, session.files[i])
+                                  ? () => _openFile(context, session, session.files[i])
                                   : null,
                             ),
                         ],
@@ -130,28 +132,97 @@ class SessionDetailScreen extends StatelessWidget {
     );
   }
 
-  void _openFile(BuildContext context, TransferFileManifest file) async {
-    final exists = await _fileExists(file.filePath);
-    if (!exists) {
-      if (context.mounted) {
-        GlassToast.show(context, 'File not found on this device', isError: true);
+  static Future<void> _openFile(
+      BuildContext context,
+      TransferSession session,
+      TransferFileManifest file,
+    ) async {
+      final saveLocation =
+          context.mounted ? context.read<SettingsCubit>().state.saveLocation : null;
+      final path = await FileLocator.locate(
+        recordedPath: file.filePath,
+        fileName: file.fileName,
+        saveLocation: saveLocation,
+      );
+
+      if (!context.mounted) return;
+
+      if (path != null) {
+        // Persist the true location so the next open is instant.
+        if (path != file.filePath) {
+          try {
+            final repo = GetIt.instance<SessionRepository>();
+            final idx = session.files.indexOf(file);
+            if (idx >= 0) {
+              await repo.updateFilePath(session.id, idx, path);
+            }
+          } catch (_) {}
+          if (!context.mounted) return;
+        }
+        await FileOpener.open(context, path);
+        return;
       }
-      return;
-    }
-    if (context.mounted) {
-      await FileOpener.open(context, file.filePath);
-    }
-  }
 
-  Future<bool> _fileExists(String path) async {
-    try {
-      return await File(path).exists();
-    } catch (_) {
-      return false;
+      _showLocateDialog(context, session, file);
     }
-  }
 
-  void _resume(BuildContext context) {
+    static void _showLocateDialog(
+      BuildContext context,
+      TransferSession session,
+      TransferFileManifest file,
+    ) {
+      final isDark = Theme.of(context).brightness == Brightness.dark;
+      showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: isDark ? const Color(0xFF1E1432) : Colors.white,
+          title: Text(
+            'File not found',
+            style: TextStyle(
+              color: isDark ? AppColors.darkTextPrimary : AppColors.textPrimary,
+            ),
+          ),
+          content: Text(
+            '"${file.fileName}" was not found in its expected location.',
+            style: TextStyle(
+              fontSize: 14,
+              color: isDark ? AppColors.darkTextSecondary : AppColors.textSecondary,
+            ),
+          ),
+          actions: [
+            TextButton.icon(
+              onPressed: () => Navigator.pop(ctx),
+              icon: const Icon(Icons.close, size: 18),
+              label: const Text('Cancel'),
+              style: TextButton.styleFrom(foregroundColor: AppColors.textSecondary),
+            ),
+            TextButton.icon(
+              onPressed: () async {
+                Navigator.pop(ctx);
+                final result = await fp.FilePicker.platform.pickFiles(
+                  allowMultiple: false,
+                  dialogTitle: 'Locate ${file.fileName}',
+                );
+                if (result == null || result.files.isEmpty || !context.mounted) return;
+                final picked = result.files.first.path;
+                if (picked == null) return;
+                try {
+                  await GetIt.instance<SessionRepository>()
+                      .updateFilePath(session.id, session.files.indexOf(file), picked);
+                } catch (_) {}
+                if (!context.mounted) return;
+                await FileOpener.open(context, picked);
+              },
+              icon: const Icon(Icons.folder_open, size: 18),
+              label: const Text('Find file…'),
+              style: TextButton.styleFrom(foregroundColor: AppColors.primary),
+            ),
+          ],
+        ),
+      );
+    }
+
+    void _resume(BuildContext context) {
     context.read<TransferCubit>().resumeSession(session.id);
     Navigator.push(
       context,

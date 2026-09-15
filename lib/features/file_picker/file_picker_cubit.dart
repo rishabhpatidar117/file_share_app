@@ -18,17 +18,26 @@ class FilePickerCubit extends Cubit<FilePickerState> {
       );
 
       if (result == null || result.files.isEmpty) {
-        emit(state.copyWith(status: FilePickerStatus.initial));
+        emit(state.copyWith(status: FilePickerStatus.picked));
         return;
       }
 
-      final pickedFiles = result.files.map((file) {
-        return PickedFile(
-          path: file.path ?? '',
+      // Merge into anything already selected so "Add more files" never drops
+      // the user's existing selection.
+      final existing = <String>{
+        for (final f in state.files) f.path,
+      };
+      final pickedFiles = List<PickedFile>.from(state.files);
+      for (final file in result.files) {
+        final path = file.path ?? '';
+        if (path.isEmpty || existing.contains(path)) continue;
+        existing.add(path);
+        pickedFiles.add(PickedFile(
+          path: path,
           name: file.name,
           size: file.size,
-        );
-      }).toList();
+        ));
+      }
 
       emit(state.copyWith(
         status: FilePickerStatus.picked,
@@ -43,11 +52,14 @@ class FilePickerCubit extends Cubit<FilePickerState> {
   }
 
   Future<void> pickFilesFromPath(List<String> paths) async {
-    final pickedFiles = <PickedFile>[];
+    final pickedFiles = List<PickedFile>.from(state.files);
+    final known = <String>{for (final f in pickedFiles) f.path};
     for (final path in paths) {
+      if (known.contains(path)) continue;
       final file = File(path);
       if (await file.exists()) {
         final stat = await file.stat();
+        known.add(path);
         pickedFiles.add(PickedFile(
           path: path,
           name: path.split(Platform.pathSeparator).last,

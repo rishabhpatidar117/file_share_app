@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
@@ -38,36 +39,118 @@ class ChunkMetadata {
 class ChunkedFileReader {
   final File file;
   final int chunkSize;
+
+  /// How many chunks beyond the current one get read ahead into a bounded
+  /// cache while a network ack is in flight. Keeps peak memory small (a few
+  /// chunks) no matter how large the file is.
+  final int prefetchChunks;
+
   late final int totalChunks;
   late final int totalSize;
 
-  ChunkedFileReader({required this.file, this.chunkSize = 512 * 1024}) {
+  RandomAccessFile? _raf;
+  Future<void>? _diskChain;
+
+  /// Next sequential read offset so back-to-back chunks skip seek operations.
+  int _sequentialOffset = 0;
+  bool _sequentialValid = false;
+  final Map<int, ChunkData> _prefetchCache = {};
+  bool _closed = false;
+
+  ChunkedFileReader({
+    required this.file,
+    this.chunkSize = 512 * 1024,
+    this.prefetchChunks = 2,
+  }) {
     totalSize = file.lengthSync();
     totalChunks = totalSize == 0 ? 1 : (totalSize / chunkSize).ceil();
   }
 
-  Future<ChunkData> readChunk(int index) async {
-    final raf = await file.open(mode: FileMode.read);
-    try {
-      final offset = index * chunkSize;
-      await raf.setPosition(offset);
-      final remaining = totalSize - offset;
-      final readSize = remaining < chunkSize ? remaining : chunkSize;
-      final bytes = await raf.read(readSize);
-      
-      return ChunkData(
-        metadata: ChunkMetadata(
-          index: index,
-          offset: offset,
-          size: readSize,
-          crc32cChecksum: Crc32c.hash(bytes),
-          isLast: index == totalChunks - 1,
-        ),
-        bytes: bytes,
-      );
-    } finally {
-      await raf.close();
+  Future<RandomAccessFile> _ensureOpen() async {
+    _raf ??= await file.open(mode: FileMode.read);
+    return _raf!;
+  }
+
+  /// Serializes disk reads (including read-ahead) so two concurrent reads can
+  /// never interleave positions on the same RandomAccessFile.
+  Future<T> _queueRead<T>(Future<T> Function(RandomAccessFile raf) op) {
+    final previous = _diskChain ?? Future<void>.value();
+    final result = previous.catchError((_) {}).then((_) async {
+      final raf = await _ensureOpen();
+      return op(raf);
+    });
+    _diskChain = result.then<void>((_) {}, onError: (_) {});
+    return result;
+  }
+
+  Future<ChunkData> readChunk(int index) {
+    if (index < 0 || index >= totalChunks) {
+      throw RangeError.range(index, 0, totalChunks - 1, 'index');
     }
+    final cached = _prefetchCache.remove(index);
+    if (cached != null) {
+      _schedulePrefetch(index + 1);
+      return Future.value(cached);
+    }
+
+    final future = _queueRead((raf) => _readFromDisk(raf, index));
+    _schedulePrefetch(index + 1);
+    return future;
+  }
+
+  Future<ChunkData> _readFromDisk(RandomAccessFile raf, int index) async {
+    final offset = index * chunkSize;
+    if (!_sequentialValid || offset != _sequentialOffset) {
+      await raf.setPosition(offset);
+    }
+    final remaining = totalSize - offset;
+    final readSize = remaining < chunkSize ? remaining : chunkSize;
+    final bytes = await raf.read(readSize);
+    _sequentialOffset = offset + readSize;
+    _sequentialValid = true;
+
+    return ChunkData(
+      metadata: ChunkMetadata(
+        index: index,
+        offset: offset,
+        size: readSize,
+        crc32cChecksum: Crc32c.hash(bytes),
+        isLast: index == totalChunks - 1,
+      ),
+      bytes: bytes,
+    );
+  }
+
+  /// Read ahead the next chunks while the current chunk is being sent/acked.
+  /// Un-awaited on purpose; bounded by [prefetchChunks] so memory stays flat.
+  void _schedulePrefetch(int from) {
+    if (_closed || prefetchChunks <= 0 || from >= totalChunks) return;
+    unawaited(_prefetchLoop(from));
+  }
+
+  Future<void> _prefetchLoop(int from) async {
+    var next = from;
+    while (next < totalChunks && _prefetchCache.length < prefetchChunks) {
+      if (_closed) return;
+      if (_prefetchCache.containsKey(next)) {
+        next++;
+        continue;
+      }
+      try {
+        final chunk = await _queueRead((raf) => _readFromDisk(raf, next));
+        if (!_closed) _prefetchCache[next] = chunk;
+        next++;
+      } catch (_) {
+        return;
+      }
+    }
+  }
+
+  Future<void> close() async {
+    _closed = true;
+    _prefetchCache.clear();
+    await _raf?.close();
+    _raf = null;
   }
 }
 

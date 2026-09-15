@@ -117,3 +117,11 @@ flutter test              # chunking / CRC / session serialization
   shadows, translucent borders.
 - Responsive: mobile single-column + bottom nav; desktop side `NavigationRail`.
 - Inter typography via `google_fonts`, motion via `flutter_animate`.
+
+
+
+
+
+1. Large file transfer approx 4-20 gb file transfer using the concurrent file transfer for faster trasfer for files and chunks. the issue is selected file is not showing properly after selection and takes too long time to load the file . first need to fix that by instead of taking whole file firstly take file path and show the file in the app before share and untill he shares it it will be in the page except when go back or remove it . and when click on the send file then transfer it with runtime instead of creating all the chunks firstly so that the app will not crash and only some of the data like 10-40 % more than the current chunk need to load so that the app will not crash and works fine in everywhere. 
+2. file allow opening using system ones if cant find . also the files are unable to open properly (shows file not found even though recentky transfered). store the true paths.
+

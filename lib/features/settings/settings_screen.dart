@@ -91,11 +91,11 @@ class SettingsScreen extends StatelessWidget {
                     builder: (context, state) {
                       return _SettingsTile(
                         icon: Icons.swap_vert,
-                        title: 'Max Concurrent Files',
-                        subtitle: '${state.maxConcurrentFiles}',
+                        title: 'Parallel Chunks',
+                        subtitle: '${state.maxConcurrentFiles} in flight',
                         trailing: _DropdownMenu<int>(
                           value: state.maxConcurrentFiles,
-                          items: List.generate(30, (i) => i + 1),
+                          items: List.generate(8, (i) => i + 1),
                           labelBuilder: (v) => '$v',
                           onChanged: (v) => context
                               .read<SettingsCubit>()

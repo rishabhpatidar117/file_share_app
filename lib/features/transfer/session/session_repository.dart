@@ -42,4 +42,15 @@ class SessionRepository {
   Future<void> updateSession(TransferSession session) async {
     await saveSession(session);
   }
+
+  /// Persists the true on-disk path for one file in a session so future opens
+  /// no longer fall back to a stale location.
+  Future<void> updateFilePath(String sessionId, int fileIndex, String newPath) async {
+    final session = await getSession(sessionId);
+    if (session == null) return;
+    final files = List<TransferFileManifest>.from(session.files);
+    if (fileIndex < 0 || fileIndex >= files.length) return;
+    files[fileIndex] = files[fileIndex].copyWith(filePath: newPath);
+    await saveSession(session.copyWith(files: files));
+  }
 }

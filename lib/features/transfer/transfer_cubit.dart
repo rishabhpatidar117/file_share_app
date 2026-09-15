@@ -36,6 +36,10 @@ class TransferCubit extends Cubit<TransferState> {
   DateTime _lastSpeedSample = DateTime.now();
   Map<int, int> _resumePoints = {};
 
+  // Number of full chunks already acknowledged by the receiver for the file
+  // currently being sent. Drives pause markers and progress.
+  int _highestAckedChunk = 0;
+
   // Receiver state.
   TransferSession? _incoming;
   String? _incomingSaveDir;
@@ -64,6 +68,13 @@ class TransferCubit extends Cubit<TransferState> {
     return kb * 1024;
   }
 
+  /// How many chunks may be in flight before the sender waits for an ack.
+  /// Reuses the persisted "max concurrent files" knob as the parallel-window
+  /// depth. Bounded (max 16) so large transfers never buffer the whole file.
+  int get _pipelineDepth =>
+      (_settingsBox.get('maxConcurrentFiles', defaultValue: 3) as int)
+          .clamp(1, 16);
+
   String get _deviceName =>
       _settingsBox.get('deviceName', defaultValue: 'My Device');
 
@@ -79,7 +90,7 @@ class TransferCubit extends Cubit<TransferState> {
         return f.status == FileTransferStatus.transferring
             ? f.copyWith(
                 status: FileTransferStatus.paused,
-                lastAckedChunk: _currentChunkIndex - 1,
+                lastAckedChunk: (_highestAckedChunk - 1).clamp(-1, f.totalChunks - 1),
               )
             : f;
       }).toList();
@@ -155,6 +166,7 @@ class TransferCubit extends Cubit<TransferState> {
     await _sessionRepo.saveSession(session);
     _currentFileIndex = 0;
     _currentChunkIndex = 0;
+    _highestAckedChunk = 0;
     _lastProgressBytes = 0;
     _lastSpeedSample = DateTime.now();
     _isPaused = false;
@@ -177,6 +189,7 @@ class TransferCubit extends Cubit<TransferState> {
     if (state.session == null) return;
     _isPaused = false;
     final chunkSize = _chunkSize;
+    final depth = _pipelineDepth;
 
     while (_currentFileIndex < state.session!.files.length) {
       if (_isPaused) return;
@@ -192,42 +205,81 @@ class TransferCubit extends Cubit<TransferState> {
         chunkSize: chunkSize,
       );
 
-      var startChunk = _resumePoints[_currentFileIndex] ?? 0;
-      if (startChunk >= reader.totalChunks) startChunk = 0;
-      _currentChunkIndex = startChunk;
-
+      Object? failure;
       var fileOk = false;
       String hash = '';
       try {
-        while (_currentChunkIndex < reader.totalChunks) {
+        var current = _resumePoints[_currentFileIndex] ??
+            fileManifest.lastAckedChunk + 1;
+        if (current < 0 || current >= reader.totalChunks) current = 0;
+        _currentChunkIndex = current;
+        _highestAckedChunk = current;
+
+        // Sliding window of chunk sends: fire up to [depth] chunks before
+        // waiting on an ack. Memory stays bounded (a few chunks) regardless of
+        // file size; the reader's read-ahead feeds the window while awaiting.
+        final inFlight = <Future<void>>[];
+        var sent = 0;
+        var acked = current;
+        Object? sendError;
+
+        while (current < reader.totalChunks) {
           if (_isPaused) return;
+          if (inFlight.length >= depth) {
+            await inFlight.removeAt(0);
+            acked++;
+          }
 
-          final chunk = await reader.readChunk(_currentChunkIndex);
-          await _sendChunkWithRetry(_currentFileIndex, chunk);
-
-          _currentChunkIndex++;
-          _updateProgress();
+          final chunk = await reader.readChunk(current);
+          inFlight.add(
+            _sendChunkWithRetry(_currentFileIndex, chunk).then<void>(
+              (_) {},
+              onError: (Object e, StackTrace st) => sendError ??= e,
+            ),
+          );
+          current++;
+          sent++;
+          _currentChunkIndex = current;
+          _highestAckedChunk = acked;
+          _updateProgress(chunksSent: sent, ackedChunks: acked);
         }
 
-        hash = await computeFileHash(fileManifest.filePath);
-        try {
-          await _transport.sendFileComplete(
-            _currentFileIndex,
-            hash,
-            fileName: fileManifest.fileName,
-            fileSize: fileManifest.fileSize,
-            totalChunks: reader.totalChunks,
-          );
-          fileOk = true;
-        } on TransportException {
-          // Receiver flagged a corrupt whole file; resend it from scratch.
-          _resumePoints[_currentFileIndex] = 0;
+        while (inFlight.isNotEmpty) {
+          await inFlight.removeAt(0);
+          acked++;
+        }
+        _highestAckedChunk = acked;
+        _updateProgress(chunksSent: sent, ackedChunks: acked);
+
+        if (sendError != null) {
+          failure = sendError;
+        } else if (!_isPaused) {
+          hash = await computeFileHash(fileManifest.filePath);
+          try {
+            await _transport.sendFileComplete(
+              _currentFileIndex,
+              hash,
+              fileName: fileManifest.fileName,
+              fileSize: fileManifest.fileSize,
+              totalChunks: reader.totalChunks,
+            );
+            fileOk = true;
+          } on TransportException {
+            // Receiver flagged a corrupt whole file; resend it from scratch.
+            _resumePoints[_currentFileIndex] = 0;
+          }
         }
       } catch (e) {
-        _failTransfer(e, fileManifest);
-        return;
+        failure = e;
+      } finally {
+        await reader.close();
       }
 
+      if (failure != null) {
+        _failTransfer(failure, fileManifest);
+        return;
+      }
+      if (_isPaused) return;
       if (!fileOk) continue;
 
       _updateFileStatus(_currentFileIndex, FileTransferStatus.completed,
@@ -296,15 +348,15 @@ class TransferCubit extends Cubit<TransferState> {
     emit(state.copyWith(session: session));
   }
 
-  void _updateProgress() {
+  void _updateProgress({required int chunksSent, required int ackedChunks}) {
     if (state.session == null) return;
     final session = state.session!;
 
     final files = List<TransferFileManifest>.from(session.files);
     if (_currentFileIndex < files.length) {
       files[_currentFileIndex] = files[_currentFileIndex].copyWith(
-        chunksSent: _currentChunkIndex,
-        lastAckedChunk: _currentChunkIndex - 1,
+        chunksSent: chunksSent,
+        lastAckedChunk: ackedChunks - 1,
         status: FileTransferStatus.transferring,
       );
     }
@@ -348,7 +400,7 @@ class TransferCubit extends Cubit<TransferState> {
     if (_currentFileIndex < files.length) {
       files[_currentFileIndex] = files[_currentFileIndex].copyWith(
         status: FileTransferStatus.paused,
-        lastAckedChunk: _currentChunkIndex - 1,
+        lastAckedChunk: (_highestAckedChunk - 1).clamp(-1, files[_currentFileIndex].totalChunks - 1),
       );
     }
 
@@ -429,6 +481,7 @@ class TransferCubit extends Cubit<TransferState> {
         _currentFileIndex = i;
         final fromReceiver = _resumePoints[i];
         _currentChunkIndex = fromReceiver ?? session.files[i].lastAckedChunk + 1;
+        _highestAckedChunk = _currentChunkIndex;
         break;
       }
     }
