@@ -57,7 +57,8 @@ class TransferScreen extends StatelessWidget {
                 Expanded(
                   child: BlocBuilder<TransferCubit, TransferState>(
                     builder: (context, state) {
-                      if (state.status == TransferStatus.idle) {
+                      if (state.status == TransferStatus.idle &&
+                          state.incomingSession == null) {
                         return _buildIdleState(isDark);
                       }
                       return _buildTransferContent(context, state, isDark);
@@ -96,8 +97,16 @@ class TransferScreen extends StatelessWidget {
   }
 
   Widget _buildTransferContent(BuildContext context, TransferState state, bool isDark) {
-    final session = state.session;
+    // Receiving: the incoming session owns the realtime progress.  Sending:
+    // the outgoing session does.  If both are active (we sent a file while
+    // also receiving) the outgoing session wins, matching the network layer.
+    final isReceiver = state.status == TransferStatus.idle &&
+        state.incomingSession != null;
+    final session =
+        isReceiver ? state.incomingSession : state.session;
     if (session == null) return const SizedBox.shrink();
+    final progress =
+        isReceiver ? state.incomingProgress : state.overallProgress;
 
     return CustomScrollView(
       slivers: [
@@ -109,23 +118,28 @@ class TransferScreen extends StatelessWidget {
               child: Column(
                 children: [
                   ProgressRing(
-                    progress: state.overallProgress,
+                    progress: progress,
                     size: 100,
                     strokeWidth: 8,
                     child: Text(
-                      '${(state.overallProgress * 100).toInt()}%',
+                      '${(progress * 100).toInt()}%',
                       style: AppTextStyles.heading2(isDark: isDark),
                     ),
                   ).animate().scale(),
                   const SizedBox(height: 16),
                   Text(
-                    state.status == TransferStatus.transferring
-                        ? 'Transferring...'
-                        : state.status == TransferStatus.paused
-                            ? 'Paused'
-                            : state.status == TransferStatus.completed
-                                ? 'Completed'
-                                : 'Preparing...',
+                    isReceiver && state.incomingSession?.status ==
+                            SessionStatus.completed
+                        ? 'Completed'
+                        : isReceiver
+                            ? 'Receiving...'
+                            : state.status == TransferStatus.transferring
+                                ? 'Transferring...'
+                                : state.status == TransferStatus.paused
+                                    ? 'Paused'
+                                    : state.status == TransferStatus.completed
+                                        ? 'Completed'
+                                        : 'Preparing...',
                     style: AppTextStyles.body(isDark: isDark),
                   ),
                   if (state.speed > 0) ...[
@@ -251,6 +265,21 @@ class TransferScreen extends StatelessWidget {
                 Navigator.pop(context);
                 Navigator.pop(context);
               },
+            ),
+          ] else if (state.incomingSession != null &&
+              state.incomingSession!.status == SessionStatus.completed) ...[
+            _ControlButton(
+              icon: Icons.check_circle,
+              label: 'Done',
+              color: AppColors.success,
+              onTap: () => Navigator.pop(context),
+            ),
+          ] else if (state.incomingSession != null) ...[
+            _ControlButton(
+              icon: Icons.download_done,
+              label: 'Receiving',
+              color: AppColors.primary,
+              onTap: () => Navigator.pop(context),
             ),
           ],
         ],

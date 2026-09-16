@@ -6,6 +6,7 @@ import '../core/theme/app_theme.dart';
 import '../features/home/home_screen.dart';
 import '../features/discovery/discovery_cubit.dart';
 import '../features/transfer/transfer_cubit.dart';
+import '../features/transfer/transfer_overlay.dart';
 import '../features/settings/settings_cubit.dart';
 import '../features/history/history_cubit.dart';
 import '../features/chat/chat_cubit.dart';
@@ -33,6 +34,17 @@ class SwiftShareApp extends StatelessWidget {
             darkTheme: AppTheme.dark(),
             themeMode: settingsState.isDarkMode ? ThemeMode.dark : ThemeMode.light,
             home: const _UiReadyGate(child: HomeScreen()),
+            // Keep the transfer overlay above every navigator route so an
+            // in-progress send/receive is always visible and one tap away,
+            // no matter which screen the user has navigated to.
+            builder: (context, child) {
+              return Stack(
+                children: [
+                  ?child,
+                  const TransferOverlay(),
+                ],
+              );
+            },
           );
         },
       ),

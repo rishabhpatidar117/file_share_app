@@ -15,6 +15,7 @@ import '../../core/widgets/glass_toast.dart';
 import '../../core/widgets/gradient_background.dart';
 import '../../transport/device_info.dart';
 import '../../transport/qr_connect_payload.dart';
+import '../../transport/transport_kind.dart';
 import '../../transport/transport_channel.dart'
     show PeerConnection, kSwiftShareServicePort;
 import '../settings/settings_cubit.dart';
@@ -57,12 +58,16 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
 
   @override
   void dispose() {
+    // Only tear down discovery/listening (the beacon and server socket).  Do
+    // NOT disconnect the peer link here — the transport is a singleton and the
+    // TCP socket must survive screen navigation so transfers and chat keep
+    // working when the user leaves this screen.  The peer is only torn down
+    // explicitly via the Disconnect button or when the transfer completes.
     if (widget.isSender) {
       _cubit.stopDiscovery();
     } else {
       _cubit.stopListening();
     }
-    _cubit.disconnectPeer();
     super.dispose();
   }
 
@@ -424,9 +429,10 @@ Widget _buildConnectedCard(PeerConnection? peer, bool isDark) {
                         device: device,
                         isDark: isDark,
                         onTap: () async {
-                          final connected = await _cubit.connectToDevice(
-                            device,
-                          );
+                          final connected =
+                              device.kind == TransportKind.wifiDirect
+                                  ? await _cubit.connectWifiDirect(device)
+                                  : await _cubit.connectToDevice(device);
                           if (!connected) return;
                           if (!context.mounted) return;
                           GlassToast.show(
@@ -888,14 +894,55 @@ class _DeviceCard extends StatelessWidget {
                   size: 26,
                 ),
               ),
-              const SizedBox(width: 16),
+              const SizedBox(width: 12),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      device.name,
-                      style: AppTextStyles.heading3(isDark: isDark),
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            device.name,
+                            style: AppTextStyles.heading3(isDark: isDark),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (device.kind == TransportKind.wifiDirect) ...[
+                          const SizedBox(width: 8),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: AppColors.success.withValues(alpha: 0.15),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(
+                                  Icons.wifi_tethering,
+                                  size: 12,
+                                  color: AppColors.success,
+                                ),
+                                const SizedBox(width: 3),
+                                Text(
+                                  'Wi-Fi Direct',
+                                  style: AppTextStyles.bodySmall(
+                                    isDark: isDark,
+                                  ).copyWith(
+                                    color: AppColors.success,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
                     const SizedBox(height: 2),
                     Text(

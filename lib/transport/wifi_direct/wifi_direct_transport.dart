@@ -39,8 +39,21 @@ class WifiDirectTransport extends LanSocketTransport {
       : _p2p = p2p ?? const WifiP2pClient(),
         super(kind: TransportKind.wifiDirect);
 
+  /// Exposes the P2P client so the DiscoveryCubit can drive peer discovery
+  /// independently from the transport.
+  @override
+  WifiP2pClient? get wifiP2pClient => _p2p;
+
   @override
   Future<void> connectToDevice(DeviceInfo device) async {
+    // If the caller supplied a reachable IP address (e.g. scanned QR code or
+    // manual IP entry), skip the P2P group dance and connect directly over the
+    // normal TCP path. Wi-Fi Direct peer-discovered devices carry no address
+    // (only the MAC), so they must go through group resolution below.
+    if (device.address != null && device.address!.isNotEmpty) {
+      return super.connectToDevice(device);
+    }
+
     final group = await _p2p.groupInfo();
 
     if (group == null || !group.inGroup) {
@@ -53,8 +66,6 @@ class WifiDirectTransport extends LanSocketTransport {
     }
 
     if (group.isGroupOwner) {
-      // The peer reaches us inbound over the P2P interface; our listener is
-      // already bound to 0.0.0.0 via startIncoming, so we wait for the client.
       updateState(TransportState.error);
       throw TransportException(
         'This device is the group owner of the Wi-Fi Direct group — there is '

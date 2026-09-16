@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'device_info.dart';
 import 'transport_kind.dart';
+import 'wifi_direct/wifi_p2p_client.dart';
 import '../core/utils/chunker.dart';
 
 /// Default TCP service port shared across LAN transports.
@@ -233,6 +234,12 @@ abstract class TransportChannel {
   /// network segment. Transfer semantics (chunking, retry, resume, CRC,
   /// scheduling) are identical across every kind; only the link is different.
   TransportKind get transportKind => TransportKind.lan;
+
+  /// Non-null on transports that expose Wi-Fi Direct peer discovery
+  /// (currently Android Wi-Fi Direct). Null on pure-LAN transports.
+  /// The DiscoveryCubit uses this to run P2P discovery in parallel with the
+  /// LAN beacon.
+  WifiP2pClient? get wifiP2pClient => null;
 
   // ---- Sender (outgoing) side ----
 

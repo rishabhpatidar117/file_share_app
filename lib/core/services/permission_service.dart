@@ -1,4 +1,6 @@
+import 'dart:io';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'notification_service.dart';
 
@@ -11,6 +13,9 @@ import 'notification_service.dart';
 class PermissionService {
   final NotificationService _notifications;
 
+  static const MethodChannel _permissionChannel =
+      MethodChannel('swiftshare/permissions');
+
   PermissionService(this._notifications);
 
   /// Returns true when network access is usable; on Android this requires no
@@ -19,7 +24,6 @@ class PermissionService {
   Future<bool> ensureNetworkAccess() async {
     if (!kIsWeb &&
         defaultTargetPlatform == TargetPlatform.android) {
-      // INTERNET is auto-granted; nothing to prompt for raw sockets.
       return true;
     }
     return true;
@@ -41,5 +45,21 @@ class PermissionService {
       }
     }
     return true;
+  }
+
+  /// Request the runtime permissions needed for Wi-Fi Direct on Android
+  /// (ACCESS_FINE_LOCATION on API ≤32, NEARBY_WIFI_DEVICES on API 33+).
+  /// No-op on other platforms. Returns true when the permissions are granted.
+  Future<bool> requestWifiDirectPermissions() async {
+    if (kIsWeb) return true;
+    if (!Platform.isAndroid) return true;
+    try {
+      return await _permissionChannel.invokeMethod<bool>(
+            'requestWifiDirect',
+          ) ??
+          false;
+    } catch (_) {
+      return false;
+    }
   }
 }

@@ -25,6 +25,7 @@ Future<void> _requestRuntimePermissions() async {
   final permissions = getIt<PermissionService>();
   await permissions.ensureNetworkAccess();
   await permissions.requestNotificationPermission();
+  await permissions.requestWifiDirectPermissions();
 }
 
 Future<void> _configureWindowAndOverlays() async {

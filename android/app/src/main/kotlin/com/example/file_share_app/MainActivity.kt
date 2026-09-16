@@ -16,6 +16,7 @@ import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import androidx.core.app.ActivityCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -25,10 +26,15 @@ import java.net.NetworkInterface
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : FlutterActivity() {
+    companion object {
+        private const val WIFI_DIRECT_PERMISSION_REQUEST_CODE = 9001
+    }
+
     private val networkInfoChannelName = "swiftshare/network_info"
     private val p2pChannelName = "swiftshare/wifi_p2p"
     private val p2pEventsChannelName = "swiftshare/wifi_p2p_events"
     private val lifecycleChannelName = "swiftshare/transfer_lifecycle"
+    private val permissionChannelName = "swiftshare/permissions"
 
     private var wifiP2pManager: WifiP2pManager? = null
     private var p2pChannel: WifiP2pManager.Channel? = null
@@ -36,6 +42,7 @@ class MainActivity : FlutterActivity() {
     private var peersSink: EventChannel.EventSink? = null
     private var currentPeers: List<Map<String, Any?>> = emptyList()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var permissionResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -48,6 +55,7 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
+        setupPermissions(flutterEngine)
         setupWifiP2p(flutterEngine)
         setupTransferLifecycle(flutterEngine)
         registerP2pReceivers()
@@ -166,6 +174,69 @@ class MainActivity : FlutterActivity() {
         } catch (_: Throwable) {}
     }
 
+    // ---------------------------------------------------------------------------
+    // Runtime permissions (swiftshare/permissions)
+    // ---------------------------------------------------------------------------
+
+    private fun setupPermissions(flutterEngine: FlutterEngine) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, permissionChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "requestWifiDirect" -> requestWifiDirectPermissions(result)
+                    "hasWifiDirect" -> result.success(hasWifiDirectPermissions())
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    /** Permissions required to scan/connect via Wi-Fi Direct on this SDK level. */
+    private fun requiredWifiDirectPermissions(): Array<String> {
+        val perms = ArrayList<String>()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            perms.add(android.Manifest.permission.ACCESS_FINE_LOCATION)
+        } else {
+            perms.add(android.Manifest.permission.NEARBY_WIFI_DEVICES)
+        }
+        return perms.toTypedArray()
+    }
+
+    private fun hasWifiDirectPermissions(): Boolean =
+        requiredWifiDirectPermissions().all { isPermissionGranted(it) }
+
+    private fun isPermissionGranted(permission: String): Boolean =
+        try {
+            ActivityCompat.checkSelfPermission(this, permission) ==
+                PackageManager.PERMISSION_GRANTED
+        } catch (_: Throwable) {
+            false
+        }
+
+    private fun requestWifiDirectPermissions(result: MethodChannel.Result) {
+        if (hasWifiDirectPermissions()) {
+            result.success(true)
+            return
+        }
+        val missing = requiredWifiDirectPermissions().filter { !isPermissionGranted(it) }
+        permissionResult = result
+        ActivityCompat.requestPermissions(
+            this,
+            missing.toTypedArray(),
+            WIFI_DIRECT_PERMISSION_REQUEST_CODE,
+        )
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == WIFI_DIRECT_PERMISSION_REQUEST_CODE) {
+            permissionResult?.success(hasWifiDirectPermissions())
+            permissionResult = null
+        }
+    }
+
     private fun startP2pDiscovery(): Boolean {
         val manager = wifiP2pManager ?: return false
         val channel = p2pChannel ?: return false
@@ -259,6 +330,22 @@ class MainActivity : FlutterActivity() {
         return wrapTry { p2pInterfaceIpv4() }
     }
 
+    /**
+     * Auto-accept an incoming Wi-Fi Direct connection request by calling connect()
+     * with the requesting peer's address. This matches what the system permission
+     * dialog would do when the user taps "Accept", but does it transparently so
+     * the Dart side sees the group form without manual intervention.
+     */
+    private fun autoAcceptIncoming(hostAddress: String?) {
+        if (hostAddress == null || hostAddress.isEmpty()) return
+        val manager = wifiP2pManager ?: return
+        val channel = p2pChannel ?: return
+        try {
+            val config = WifiP2pConfig().apply { deviceAddress = hostAddress }
+            manager.connect(channel, config, silentActionListener())
+        } catch (_: Throwable) {}
+    }
+
     private fun p2pInterfaceIpv4(): String? {
         val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
         while (interfaces.hasMoreElements()) {
@@ -302,7 +389,30 @@ class MainActivity : FlutterActivity() {
                         } catch (_: Throwable) {}
                     }
                     WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
-                        // Group state changed; the Dart side re-queries getGroupInfo.
+                        // A peer is either creating a group with us (formation
+                        // not finished yet) or a group just changed state. When
+                        // the group is still forming we auto-accept by calling
+                        // connect() with the remote device address, the same
+                        // way the system UI would approve an invite.
+                        val info = intent.getParcelableExtra<WifiP2pInfo>(
+                            WifiP2pManager.EXTRA_WIFI_P2P_INFO,
+                        )
+                        if (info != null && !info.groupFormed &&
+                            info.groupOwnerAddress != null
+                        ) {
+                            autoAcceptIncoming(info.groupOwnerAddress.hostAddress)
+                        }
+                    }
+                    WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION -> {
+                        val device = intent.getParcelableExtra<android.net.wifi.p2p.WifiP2pDevice>(
+                            WifiP2pManager.EXTRA_WIFI_P2P_DEVICE,
+                        )
+                        if (device != null && device.deviceName != null) {
+                            val name = device.deviceName
+                            if (name != null && name.isNotEmpty()) {
+                                android.util.Log.d("SwiftShare", "P2P device name: $name")
+                            }
+                        }
                     }
                     else -> {}
                 }
