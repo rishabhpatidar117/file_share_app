@@ -40,6 +40,29 @@ Key log anchors you must observe:
 - [ ] Kill app mid-file, re-send → parity points used (no corruption).
 - [ ] Lock both screens mid-transfer → no stall, no crash (engine not UI-bound).
 
+### Terminal-state sync (sender/receiver must converge, never diverge)
+- [ ] **Sender fails** (e.g. file picked from a provider that throws, or delete the
+      source file before sending): sender shows **Failed** AND receiver flips from
+      "Waiting" to **Failed** within a few seconds (new `session_failed` frame).
+- [ ] Reverse check: connect, sender begins, then receiver's disk fills / save
+      dir is made read-only → receiver shows **Failed** AND sender shows **Failed**
+      (not stuck "Transferring"/"Preparing").
+- [ ] Link cut mid-receive (toggle Wi-Fi / kill sender app): receiver exits
+      "Waiting" → shows **Failed** (connection-lost handler) — check both the
+      outgoing *and* incoming cards.
+- [ ] No stale "Waiting" remains after any of the above; next transfer starts clean.
+- [ ] Log `[TRANSFER]` shows the reason; `logcat | findstr session_failed` frames
+      are emitted exactly on the failing side.
+
+### SAF `content://` sourcing (Bug-2 regression guard)
+- [ ] Pick files via the Android document picker (Google Drive, Downloads, Photos —
+      test at least two different providers) at 50 MB and 500 MB → transfer
+      completes with correct hash. (Old `/proc/self/fd/<n>` path is gone; files are
+      bridged to an app-cache temp copy.)
+- [ ] Transfer completes and the temp cache file is cleaned up afterwards
+      (`adb shell run-as <pkg> ls cache/` shows no leftover `ss_*` files).
+- [ ] Failed send of a content-picked file also cleans up its temp copy.
+
 ### LAN concurrency sweep (all must pass integrity)
 | maxConcurrentFiles | result (OK/fail) |
 |---|---|

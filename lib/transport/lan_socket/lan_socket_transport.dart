@@ -525,6 +525,13 @@ class LanSocketTransport extends TransportChannel {
       case 'session_complete':
         incomingSessionCompleteController.add(null);
         break;
+
+      case 'session_failed':
+        sessionFailedController.add(SessionFailed(
+          sessionId: message['sessionId'] as String? ?? '',
+          reason: message['reason'] as String? ?? 'Transfer aborted by remote device',
+        ));
+        break;
     }
   }
 
@@ -671,6 +678,26 @@ class LanSocketTransport extends TransportChannel {
     await _sendMessage(socket, {
       'type': 'session_complete',
       'sessionId': sessionId,
+    });
+  }
+
+  @override
+  Future<void> sendSessionFailed(String sessionId, String reason) async {
+    // Works from either direction: the receiver sends over the socket it
+    // accepted, the sender sends over the socket it initiated (or any peer).
+    Socket? socket;
+    if (_incomingSocket != null) {
+      socket = _incomingSocket;
+    } else if (_connectedSocket != null) {
+      socket = _connectedSocket;
+    } else if (_peerSockets.isNotEmpty) {
+      socket = _peerSockets.first;
+    }
+    if (socket == null) return;
+    await _sendMessage(socket, {
+      'type': 'session_failed',
+      'sessionId': sessionId,
+      'reason': reason,
     });
   }
 

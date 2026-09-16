@@ -133,6 +133,9 @@ abstract class TransportChannel {
   @protected
   final StreamController<String> peerDisconnectedController =
       StreamController<String>.broadcast();
+  @protected
+  final StreamController<SessionFailed> sessionFailedController =
+      StreamController<SessionFailed>.broadcast();
 
   Stream<DeviceInfo> get onDeviceFound => deviceFoundController.stream;
   Stream<TransportState> get onStateChanged => stateController.stream;
@@ -151,6 +154,10 @@ abstract class TransportChannel {
   /// A previously established peer link was torn down (disconnect, error or
   /// socket close). Emits the peer's name.
   Stream<String> get onPeerDisconnected => peerDisconnectedController.stream;
+
+  /// The remote peer aborted an active session (failure, disk error, or lost
+  /// the file it was sending from). Emits the session id + reason.
+  Stream<SessionFailed> get onSessionFailed => sessionFailedController.stream;
 
   TransportState _state = TransportState.disconnected;
   TransportState get state => _state;
@@ -202,6 +209,12 @@ abstract class TransportChannel {
   /// Notify the receiver that all files have been sent and verified.
   Future<void> sendSessionComplete(String sessionId);
 
+  /// Tell the peer that an active session cannot continue and should be
+  /// abandoned (sender reports its own failure; receiver reports a write/verify
+  /// failure). Both sides use the same frame so the two ends always converge on
+  /// the same terminal state instead of one staying "Waiting" forever.
+  Future<void> sendSessionFailed(String sessionId, String reason);
+
   /// Release the peer links (sends a disconnect frame so the peer notices too),
   /// keeping any local listener/discovery sockets running.
   Future<void> disconnectPeers();
@@ -242,6 +255,7 @@ abstract class TransportChannel {
     incomingSessionCompleteController.close();
     peerConnectedController.close();
     peerDisconnectedController.close();
+    sessionFailedController.close();
   }
 }
 
@@ -249,6 +263,13 @@ abstract class TransportChannel {
 class PeerConnection {
   final String deviceName;
   const PeerConnection({required this.deviceName});
+}
+
+/// The remote peer reported that an active session could not continue.
+class SessionFailed {
+  final String sessionId;
+  final String reason;
+  const SessionFailed({required this.sessionId, required this.reason});
 }
 
 class ChunkReceivedEvent {

@@ -770,4 +770,39 @@ void main() {
     await owner.disconnect();
     await client.disconnect();
   });
+
+  test(
+      'session_failed propagates a terminal state to the peer in BOTH '
+      'directions (no more sender=failed / receiver=waiting divergence)', () async {
+    // Build the loopback link: `sender` initiates out, `receiver` accepts in.
+    await sender.connectToDevice(const DeviceInfo(
+      id: 'peer',
+      name: 'Peer',
+      address: '127.0.0.1',
+      port: LanSocketTransport.servicePort,
+    ));
+    await waitForConnected(sender);
+    await waitForConnected(receiver);
+
+    // Sender → receiver abort.
+    final senderFailure = Completer<SessionFailed>();
+    final rxSub = receiver.onSessionFailed.listen(senderFailure.complete);
+    await sender.sendSessionFailed('session-a', 'source unreadable');
+    final seenByReceiver =
+        await senderFailure.future.timeout(const Duration(seconds: 5));
+    expect(seenByReceiver.sessionId, 'session-a');
+    expect(seenByReceiver.reason, contains('source unreadable'));
+
+    // Receiver → sender abort (the receiver writes to the socket it accepted).
+    final receiverFailure = Completer<SessionFailed>();
+    final txSub = sender.onSessionFailed.listen(receiverFailure.complete);
+    await receiver.sendSessionFailed('session-b', 'disk full');
+    final seenBySender =
+        await receiverFailure.future.timeout(const Duration(seconds: 5));
+    expect(seenBySender.sessionId, 'session-b');
+    expect(seenBySender.reason, contains('disk full'));
+
+    await txSub.cancel();
+    await rxSub.cancel();
+  });
 }

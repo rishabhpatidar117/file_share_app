@@ -99,6 +99,9 @@ class NearbyTransport extends TransportChannel {
   Future<void> sendSessionComplete(String sessionId) async {}
 
   @override
+  Future<void> sendSessionFailed(String sessionId, String reason) async {}
+
+  @override
   Future<void> startIncoming() async {
     // In production: NearbyConnections.startAdvertising(...)
   }

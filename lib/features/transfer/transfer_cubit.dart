@@ -46,6 +46,7 @@ class TransferCubit extends Cubit<TransferState> {
   StreamSubscription? _incomingChunkSub;
   StreamSubscription? _incomingFileCompleteSub;
   StreamSubscription? _incomingSessionCompleteSub;
+  StreamSubscription? _incomingSessionFailedSub;
   Timer? _speedTimer;
 
   // Sender state.
@@ -100,6 +101,11 @@ class TransferCubit extends Cubit<TransferState> {
   /// at chunk 0 regardless of previously acked progress.
   final Set<int> _forcedRestartFiles = {};
 
+  /// Consecutive whole-file resend (file_retry) requests sent per file index.
+  /// A resend that keeps failing past this limit is escalated to a session
+  /// failure on both ends so neither side is left stuck retrying forever.
+  final Map<int, int> _fileRetryCount = {};
+
   TransferCubit(
     this._transport,
     this._sessionRepo,
@@ -109,14 +115,53 @@ class TransferCubit extends Cubit<TransferState> {
     this._settingsBox,
   ) : super(const TransferState()) {
     _stateSub = _transport.onStateChanged.listen(_onTransportStateChanged);
-    _incomingSessionSub =
-        _transport.onIncomingSession.listen((request) => _onIncomingSession(request));
+    _incomingSessionSub = _transport.onIncomingSession.listen(
+      (request) => _onIncomingSession(request).catchError((Object e) {
+        try {
+          _transport.sendSessionFailed(request.sessionId, 'Incoming session failed: $e');
+        } catch (_) {}
+        return _failIncomingSession('Incoming session failed: $e');
+      }),
+    );
     _incomingChunkSub =
         _transport.onChunkReceived.listen((event) => _onIncomingChunk(event));
     _incomingFileCompleteSub =
         _transport.onIncomingFileComplete.listen(_onIncomingFileComplete);
     _incomingSessionCompleteSub =
         _transport.onIncomingSessionComplete.listen((_) => _onIncomingSessionComplete());
+    _incomingSessionFailedSub =
+        _transport.onSessionFailed.listen(_onSessionFailed);
+  }
+
+  /// Sender AND receiver converge on failure from the same [SessionFailed] frame.
+  ///
+  /// - If we are the receiver of the named session, fail that incoming session.
+  /// - If we are the sender of a live outgoing session and the peer reports it
+  ///   cannot continue (e.g. disk full), fail our side promptly instead of
+  ///   retrying chunks into the void until a 30 s ack timeout.
+  void _onSessionFailed(SessionFailed failure) {
+    final outgoing = state.session;
+    if (outgoing != null &&
+        outgoing.isSender &&
+        state.status == TransferStatus.transferring &&
+        (failure.sessionId.isEmpty || failure.sessionId == outgoing.id)) {
+      _isPaused = true;
+      unawaited(_foreground.stop());
+      _notifications.showMessage(
+        title: 'Transfer failed',
+        body: failure.reason,
+      );
+      emit(state.copyWith(
+        status: TransferStatus.failed,
+        errorMessage: failure.reason,
+      ));
+      return;
+    }
+    final activeIncoming = _incoming;
+    if (activeIncoming != null &&
+        activeIncoming.id == failure.sessionId) {
+      unawaited(_failIncomingSession('Sender aborted: ${failure.reason}'));
+    }
   }
 
   int get _chunkSize {
@@ -138,11 +183,21 @@ class TransferCubit extends Cubit<TransferState> {
   String get _deviceName =>
       _settingsBox.get('deviceName', defaultValue: 'My Device');
 
-  void _onTransportStateChanged(TransportState transportState) {
-    final neverTransferring = state.session == null ||
-        state.status != TransferStatus.transferring ||
-        _isPaused;
-    if (neverTransferring) return;
+void _onTransportStateChanged(TransportState transportState) {
+  // A live incoming session has no "pause later" option: if the link dies mid
+  // receive, fail the session on this side too, so the receiver never stays
+  // "Waiting" while the sender has already failed.
+  if (_incoming != null &&
+      (transportState == TransportState.disconnected ||
+          transportState == TransportState.error)) {
+    unawaited(_failIncomingSession('Connection lost while receiving.'));
+    return;
+  }
+
+  final neverTransferring = state.session == null ||
+      state.status != TransferStatus.transferring ||
+      _isPaused;
+  if (neverTransferring) return;
 
     if (transportState == TransportState.disconnected ||
         transportState == TransportState.error) {
@@ -221,6 +276,7 @@ class TransferCubit extends Cubit<TransferState> {
         status: TransferStatus.failed,
         errorMessage: 'Could not start session: $e',
       ));
+      unawaited(_notifyPeerSessionFailed('Could not start session: $e'));
       return;
     }
 
@@ -308,22 +364,27 @@ Future<void> _logTransportDecision() async {
         continue;
       }
 
-      // SAF picks return `content://` URIs (no cache copy), so resolve them to
-      // a live native fd path the reader/hash can open like a plain file. The
-      // descriptor stays open for the whole file and is closed in the cleanup
-      // below.
-      SafOpenFd? contentFd;
+      // SAF picks return `content://` URIs (no cache copy), which dart:io
+      // cannot open directly. `_resolveSourceForSend` bridges such URIs into a
+      // private cache file first (the `/proc/self/fd/<n>` pseudo-path some
+      // providers hand out fails to re-open with EACCES on Android), so the
+      // reader and hash run against a real file. The temp copy is deleted once
+      // this file has been sent or failed.
+      var tempCopy = false;
       String sourcePath = fileManifest.filePath;
       final ChunkedFileReader reader;
       try {
-        final resolved = await _resolveSourceForSend(fileManifest.filePath);
+        final resolved = await _resolveSourceForSend(
+          fileManifest.filePath,
+          fileManifest.fileName,
+        );
         sourcePath = resolved.$1;
-        contentFd = resolved.$2;
+        tempCopy = resolved.$2;
         reader = ChunkedFileReader(file: File(sourcePath), chunkSize: chunkSize);
       } catch (e) {
-        if (contentFd != null) {
+        if (tempCopy) {
           try {
-            await Saf().closeFileDescriptor(contentFd.fd);
+            await File(sourcePath).delete();
           } catch (_) {}
         }
         _failTransfer(e, fileManifest);
@@ -410,9 +471,9 @@ Future<void> _logTransportDecision() async {
         failure = e;
       } finally {
         await reader.close();
-        if (contentFd != null) {
+        if (tempCopy) {
           try {
-            await Saf().closeFileDescriptor(contentFd.fd);
+            await File(sourcePath).delete();
           } catch (_) {}
         }
       }
@@ -453,14 +514,27 @@ Future<void> _logTransportDecision() async {
   /// Resolves the path given to the sender into something [dart:io] can open.
   ///
   /// Regular files pass through unchanged. `content://` URIs (from SAF picks)
-  /// are bridged to a native fd via `/proc/self/fd/<fd>`, which the
-  /// existing [ChunkedFileReader] and [computeFileHash] can stream like any
-  /// file — no whole-file copy into app cache. The caller must close the
-  /// returned fd once the file is done.
-  Future<(String, SafOpenFd?)> _resolveSourceForSend(String filePath) async {
-    if (!filePath.startsWith('content://')) return (filePath, null);
-    final fd = await Saf().openFileDescriptor(filePath, 'r');
-    return (fd.path, fd);
+  /// are bridged into a private temporary cache file via
+  /// [Saf.copyToLocalFile], which streams through the granted content resolver.
+  /// Dart's [File] cannot safely re-open the `/proc/self/fd/<fd>` pseudo-path a
+  /// provider hands out — the kernel denies a fresh `open()` of that symlink
+  /// with EACCES on Android. Stream-copying once avoids that entirely; the
+  /// caller deletes the temp file when the file is done.
+  Future<(String, bool)> _resolveSourceForSend(
+    String filePath,
+    String displayName,
+  ) async {
+    if (!filePath.startsWith('content://')) return (filePath, false);
+    final tmpDir = await getTemporaryDirectory();
+    final base =
+        (displayName.isEmpty ? 'file' : displayName).replaceAll(
+          RegExp(r'[\\/:*?"<>|]'),
+          '_',
+        );
+    final tmpPath =
+        '${tmpDir.path}/ss_${DateTime.now().microsecondsSinceEpoch}_$base';
+    await Saf().copyToLocalFile(filePath, tmpPath);
+    return (tmpPath, true);
   }
 
   Future<void> _sendChunkWithRetry(int fileIndex, ChunkData chunk) async {
@@ -520,6 +594,20 @@ Future<void> _logTransportDecision() async {
       status: TransferStatus.failed,
       errorMessage: 'Transfer failed: $e',
     ));
+    // Tell the peer the session is dead so the receiver stops showing
+    // "Waiting" and converges on "Failed" too.
+    unawaited(_notifyPeerSessionFailed('Transfer failed: $e'));
+  }
+
+  /// Best-effort `session_failed` frame to the peer. Never throws; if the link
+  /// is already gone the peer's own transport-disconnect handler will converge
+  /// on a failed state.
+  Future<void> _notifyPeerSessionFailed(String reason) async {
+    final sessionId = state.session?.id ?? '';
+    if (sessionId.isEmpty) return;
+    try {
+      await _transport.sendSessionFailed(sessionId, reason);
+    } catch (_) {}
   }
 
   void _updateFileStatus(int index, FileTransferStatus status, {String? actualHash}) {
@@ -674,6 +762,7 @@ Future<void> _logTransportDecision() async {
         status: TransferStatus.failed,
         errorMessage: 'Could not reconnect: $e',
       ));
+      unawaited(_notifyPeerSessionFailed('Could not reconnect: $e'));
       return;
     }
 
@@ -720,82 +809,125 @@ Future<void> _logTransportDecision() async {
   // ---------------------------------------------------------------------------
 
   Future<void> _onIncomingSession(IncomingSession request) async {
-    final saveDir = await _resolveSaveDirectory();
-    final manifests = <TransferFileManifest>[];
-    for (final meta in request.files) {
-      final dest = await SwiftShareStore.createDestination(saveDir, meta.fileName);
-      manifests.add(TransferFileManifest(
-        fileName: meta.fileName,
-        filePath: dest.path,
-        fileSize: meta.fileSize,
-        expectedHash: meta.sha256,
-        totalChunks: meta.totalChunks,
-        lastAckedChunk: -1,
-      ));
-    }
-
-    final incoming = TransferSession(
-      id: request.sessionId,
-      remoteDeviceName: request.remoteDeviceName,
-      isSender: false,
-      status: SessionStatus.transferring,
-      files: manifests,
-      createdAt: DateTime.now(),
-    );
-    _incoming = incoming;
-    _incomingSaveDir = saveDir;
-    _incomingChunkSize = request.chunkSize > 0 ? request.chunkSize : _chunkSize;
-
-    // Reset all receiver bookkeeping when a genuinely new session arrives.
-    // When the same session is re-negotiated (pause/resume) the warm prefix
-    // maps are kept so we don't need to re-verify data already on disk.
-    if (_incomingSessionId != request.sessionId) {
-      _incomingSessionId = request.sessionId;
-      for (final raf in _incomingRafs.values) {
-        try {
-          await raf.close();
-        } catch (_) {}
+    try {
+      final saveDir = await _resolveSaveDirectory();
+      final manifests = <TransferFileManifest>[];
+      for (final meta in request.files) {
+        final dest = await SwiftShareStore.createDestination(saveDir, meta.fileName);
+        manifests.add(TransferFileManifest(
+          fileName: meta.fileName,
+          filePath: dest.path,
+          fileSize: meta.fileSize,
+          expectedHash: meta.sha256,
+          totalChunks: meta.totalChunks,
+          lastAckedChunk: -1,
+        ));
       }
-      _incomingRafs.clear();
-      _incomingWriteChains.clear();
-      _incomingPendingChunks.clear();
-      _incomingContiguousChunks.clear();
-      _incomingFlushDebt.clear();
-    }
 
-    // Resume from the contiguous on-disk prefix when available (accurate
-    // for both offset-based retransmits and sequential writes).  Fall back
-    // to the legacy length heuristic for cold-starts after app restarts
-    // when the warm maps were lost.
-    final resume = <int, int>{};
-    for (var i = 0; i < request.files.length; i++) {
-      final manifest = manifests[i];
-      final warmPrefix = _incomingContiguousChunks[i];
-      if (warmPrefix != null && warmPrefix > 0) {
-        // The sender starts at the reported index, so reporting a fully
-        // received file (== totalChunks) makes it skip straight to the
-        // file_complete verification.
-        resume[i] = warmPrefix;
-      } else {
-        final part = File('${manifest.filePath}.swiftshare.part');
-        if (await part.exists()) {
-          final len = await part.length();
-          resume[i] = _nextChunkForBytes(len, request.files[i].totalChunks);
+      final incoming = TransferSession(
+        id: request.sessionId,
+        remoteDeviceName: request.remoteDeviceName,
+        isSender: false,
+        status: SessionStatus.transferring,
+        files: manifests,
+        createdAt: DateTime.now(),
+      );
+      _incoming = incoming;
+      _incomingSaveDir = saveDir;
+      _incomingChunkSize = request.chunkSize > 0 ? request.chunkSize : _chunkSize;
+
+      // Reset all receiver bookkeeping when a genuinely new session arrives.
+      // When the same session is re-negotiated (pause/resume) the warm prefix
+      // maps are kept so we don't need to re-verify data already on disk.
+      if (_incomingSessionId != request.sessionId) {
+        _incomingSessionId = request.sessionId;
+        for (final raf in _incomingRafs.values) {
+          try {
+            await raf.close();
+          } catch (_) {}
+        }
+        _incomingRafs.clear();
+        _incomingWriteChains.clear();
+        _incomingPendingChunks.clear();
+        _incomingContiguousChunks.clear();
+        _incomingFlushDebt.clear();
+        _fileRetryCount.clear();
+      }
+
+      // Resume from the contiguous on-disk prefix when available (accurate
+      // for both offset-based retransmits and sequential writes).  Fall back
+      // to the legacy length heuristic for cold-starts after app restarts
+      // when the warm maps were lost.
+      final resume = <int, int>{};
+      for (var i = 0; i < request.files.length; i++) {
+        final manifest = manifests[i];
+        final warmPrefix = _incomingContiguousChunks[i];
+        if (warmPrefix != null && warmPrefix > 0) {
+          // The sender starts at the reported index, so reporting a fully
+          // received file (== totalChunks) makes it skip straight to the
+          // file_complete verification.
+          resume[i] = warmPrefix;
         } else {
-          resume[i] = 0;
+          final part = File('${manifest.filePath}.swiftshare.part');
+          if (await part.exists()) {
+            final len = await part.length();
+            resume[i] = _nextChunkForBytes(len, request.files[i].totalChunks);
+          } else {
+            resume[i] = 0;
+          }
         }
       }
+
+      await _sessionRepo.saveSession(incoming);
+      await _transport.acceptIncoming(request.sessionId, resume);
+
+      _notifications.showMessage(
+        title: 'Incoming transfer',
+        body: '${request.remoteDeviceName} is sending '
+            '${request.files.length} file(s).',
+      );
+      unawaited(_foreground.start());
+      emit(state.copyWith(incomingSession: incoming, saveDirectory: saveDir));
+    } catch (e) {
+      // Destination creation / save-directory resolution failed (permissions,
+      // disk error, invalid path). This cannot succeed on retry: abort the
+      // session on both ends instead of leaving the sender pumping chunks into
+      // the void while this device still shows a stale welcome state.
+      try {
+        await _transport.sendSessionFailed(
+          request.sessionId,
+          'Could not prepare incoming files: $e',
+        );
+      } catch (_) {}
+      final failedSession = TransferSession(
+        id: request.sessionId,
+        remoteDeviceName: request.remoteDeviceName,
+        isSender: false,
+        status: SessionStatus.failed,
+        files: request.files
+            .map((m) => TransferFileManifest(
+                  fileName: m.fileName,
+                  filePath: '${_incomingSaveDir ?? ''}/${m.fileName}',
+                  fileSize: m.fileSize,
+                  totalChunks: m.totalChunks,
+                  status: FileTransferStatus.failed,
+                ))
+            .toList(),
+        createdAt: DateTime.now(),
+      );
+      _incoming = null;
+      _incomingSessionId = null;
+      await _sessionRepo.saveSession(failedSession);
+      unawaited(_foreground.stop());
+      _notifications.showMessage(
+        title: 'Transfer failed',
+        body: 'Incoming files could not be opened.',
+      );
+      emit(state.copyWith(
+        incomingSession: failedSession,
+        incomingError: 'Could not prepare incoming files: $e',
+      ));
     }
-
-    await _sessionRepo.saveSession(incoming);
-    await _transport.acceptIncoming(request.sessionId, resume);
-
-    _notifications.showMessage(
-      title: 'Incoming transfer',
-      body: '${request.remoteDeviceName} is sending ${request.files.length} file(s).',
-    );
-    unawaited(_foreground.start());
-    emit(state.copyWith(incomingSession: incoming, saveDirectory: saveDir));
   }
 
   Future<void> _onIncomingChunk(ChunkReceivedEvent event) async {
@@ -889,81 +1021,148 @@ Future<void> _logTransportDecision() async {
       );
       await _transport.sendChunkAck(fileIndex, event.metadata.index);
     } catch (e) {
-      await _transport.sendChunkError(fileIndex, event.metadata.index);
+      // The CRC check is routed above, so reaching this catch means the chunk
+      // could not be WRITTEN (disk full, file removed, permissions). Retrying
+      // the same chunk is guaranteed to fail again, so abort the whole session
+      // on both ends instead of looping chunk_error → retransmit → error.
+      try {
+        await _transport.sendSessionFailed(
+          _incomingSessionId ?? '',
+          'Could not save incoming data: $e',
+        );
+      } catch (_) {}
+      await _failIncomingSession('Could not save incoming data: $e');
+      return;
     }
   }
 
   Future<void> _onIncomingFileComplete(IncomingFileComplete event) async {
     final incoming = _incoming;
     if (incoming == null) return;
-    final manifest = incoming.files[event.fileIndex];
-    final partPath = '${manifest.filePath}.swiftshare.part';
-    final partFile = File(partPath);
+    try {
+      final manifest = incoming.files[event.fileIndex];
+      final partPath = '${manifest.filePath}.swiftshare.part';
+      final partFile = File(partPath);
 
-    final raf = _incomingRafs.remove(event.fileIndex);
-    if (raf != null) {
+      final raf = _incomingRafs.remove(event.fileIndex);
+      if (raf != null) {
+        try {
+          await raf.close();
+        } catch (_) {}
+      }
+      _incomingFlushDebt.remove(event.fileIndex);
+
+      if (!await partFile.exists()) {
+        // A duplicate marker (or crash after rename) can leave the part file
+        // gone but the final file already in place.  Verify and ack rather
+        // than triggering a needless full resend.
+        final finalFile = File(manifest.filePath);
+        if (await finalFile.exists() &&
+            await finalFile.length() == manifest.fileSize) {
+          if (event.sha256.isNotEmpty) {
+            final existingHash = await computeFileHashInBackground(manifest.filePath);
+            if (existingHash != event.sha256) {
+              await _incomingFailFile(event.fileIndex);
+              return;
+            }
+          }
+          await _transport.sendFileCompleteAck(event.fileIndex);
+          final files = List<TransferFileManifest>.from(_incoming!.files);
+          files[event.fileIndex] = files[event.fileIndex].copyWith(
+            status: FileTransferStatus.completed,
+            chunksSent: files[event.fileIndex].totalChunks,
+            lastAckedChunk: files[event.fileIndex].totalChunks - 1,
+          );
+          _fileRetryCount.remove(event.fileIndex);
+          _incoming = _incoming!.copyWith(files: files);
+          emit(state.copyWith(incomingSession: _incoming, incomingError: null));
+          return;
+        }
+        await _incomingFailFile(event.fileIndex);
+        return;
+      }
+
+      if (await partFile.length() != manifest.fileSize) {
+        await _incomingFailFile(event.fileIndex);
+        return;
+      }
+
+      final actualHash = await computeFileHashInBackground(partPath);
+      if (event.sha256.isNotEmpty && actualHash != event.sha256) {
+        await _incomingFailFile(event.fileIndex);
+        return;
+      }
+
+      final finalFile = File(manifest.filePath);
+      if (await finalFile.exists()) await finalFile.delete();
+      await partFile.rename(manifest.filePath);
+      await _transport.sendFileCompleteAck(event.fileIndex);
+
+      final files = List<TransferFileManifest>.from(_incoming!.files);
+      files[event.fileIndex] = files[event.fileIndex].copyWith(
+        status: FileTransferStatus.completed,
+        chunksSent: files[event.fileIndex].totalChunks,
+        lastAckedChunk: files[event.fileIndex].totalChunks - 1,
+        actualHash: actualHash,
+      );
+      _fileRetryCount.remove(event.fileIndex);
+      _incoming = _incoming!.copyWith(files: files);
+      _incomingContiguousChunks.remove(event.fileIndex);
+      _incomingPendingChunks.remove(event.fileIndex);
+      emit(state.copyWith(incomingSession: _incoming, incomingError: null));
+    } catch (e) {
+      // Verification/I/O error while finalizing the file (rename, hash read,
+      // delete). A resend cannot heal a disk-level failure, so abort the whole
+      // session on both ends.
+      try {
+        await _transport.sendSessionFailed(
+          event.sessionId,
+          'Incoming file verification failed: $e',
+        );
+      } catch (_) {}
+      await _failIncomingSession('Incoming file verification failed: $e');
+    }
+  }
+
+  /// Marks the active incoming session as failed on this device, cleans up all
+  /// receive bookkeeping, and surfaces a visible "Failed" state so the receiver
+  /// converges with the sender instead of sitting on "Waiting" forever.
+  Future<void> _failIncomingSession(String reason) async {
+    final incoming = _incoming;
+    if (incoming == null || incoming.status == SessionStatus.completed) return;
+    for (final raf in _incomingRafs.values) {
       try {
         await raf.close();
       } catch (_) {}
     }
-    _incomingFlushDebt.remove(event.fileIndex);
+    _incomingRafs.clear();
+    _incomingWriteChains.clear();
+    _incomingPendingChunks.clear();
+    _incomingContiguousChunks.clear();
+    _incomingFlushDebt.clear();
+    _incomingSessionId = null;
+    _fileRetryCount.clear();
 
-    if (!await partFile.exists()) {
-      // A duplicate marker (or crash after rename) can leave the part file
-      // gone but the final file already in place.  Verify and ack rather
-      // than triggering a needless full resend.
-      final finalFile = File(manifest.filePath);
-      if (await finalFile.exists() &&
-          await finalFile.length() == manifest.fileSize) {
-        if (event.sha256.isNotEmpty) {
-          final existingHash = await computeFileHashInBackground(manifest.filePath);
-          if (existingHash != event.sha256) {
-            await _incomingFailFile(event.fileIndex);
-            return;
-          }
-        }
-        await _transport.sendFileCompleteAck(event.fileIndex);
-        final files = List<TransferFileManifest>.from(_incoming!.files);
-        files[event.fileIndex] = files[event.fileIndex].copyWith(
-          status: FileTransferStatus.completed,
-          chunksSent: files[event.fileIndex].totalChunks,
-          lastAckedChunk: files[event.fileIndex].totalChunks - 1,
-        );
-        _incoming = _incoming!.copyWith(files: files);
-        emit(state.copyWith(incomingSession: _incoming, incomingError: null));
-        return;
-      }
-      await _incomingFailFile(event.fileIndex);
-      return;
-    }
-
-    if (await partFile.length() != manifest.fileSize) {
-      await _incomingFailFile(event.fileIndex);
-      return;
-    }
-
-    final actualHash = await computeFileHashInBackground(partPath);
-    if (event.sha256.isNotEmpty && actualHash != event.sha256) {
-      await _incomingFailFile(event.fileIndex);
-      return;
-    }
-
-    final finalFile = File(manifest.filePath);
-    if (await finalFile.exists()) await finalFile.delete();
-    await partFile.rename(manifest.filePath);
-    await _transport.sendFileCompleteAck(event.fileIndex);
-
-    final files = List<TransferFileManifest>.from(_incoming!.files);
-    files[event.fileIndex] = files[event.fileIndex].copyWith(
-      status: FileTransferStatus.completed,
-      chunksSent: files[event.fileIndex].totalChunks,
-      lastAckedChunk: files[event.fileIndex].totalChunks - 1,
-      actualHash: actualHash,
+    final failedFiles = incoming.files
+        .map((f) => f.status == FileTransferStatus.completed
+            ? f
+            : f.copyWith(status: FileTransferStatus.failed))
+        .toList();
+    final failed = incoming.copyWith(
+      status: SessionStatus.failed,
+      files: failedFiles,
     );
-    _incoming = _incoming!.copyWith(files: files);
-    _incomingContiguousChunks.remove(event.fileIndex);
-    _incomingPendingChunks.remove(event.fileIndex);
-    emit(state.copyWith(incomingSession: _incoming, incomingError: null));
+    await _sessionRepo.saveSession(failed);
+    unawaited(_foreground.stop());
+    _notifications.showMessage(
+      title: 'Transfer failed',
+      body: reason,
+    );
+    emit(state.copyWith(
+      incomingSession: failed,
+      incomingError: reason,
+    ));
+    _incoming = null;
   }
 
   Future<void> _incomingFailFile(int fileIndex) async {
@@ -993,6 +1192,21 @@ Future<void> _logTransportDecision() async {
       incomingSession: _incoming,
       incomingError: 'File verification failed; requesting resend…',
     ));
+
+    // A whole-file resend that keeps failing is not going to fix itself:
+    // escalate to a session failure so both ends stop retrying forever.
+    final retries = (_fileRetryCount[fileIndex] ?? 0) + 1;
+    _fileRetryCount[fileIndex] = retries;
+    if (retries >= 3) {
+      try {
+        await _transport.sendSessionFailed(
+          _incomingSessionId ?? '',
+          'File failed verification after repeated resends.',
+        );
+      } catch (_) {}
+      await _failIncomingSession('File failed verification after repeated resends.');
+      return;
+    }
     await _transport.sendFileRetry(fileIndex);
   }
 
@@ -1072,6 +1286,7 @@ Future<void> _logTransportDecision() async {
     _incomingChunkSub?.cancel();
     _incomingFileCompleteSub?.cancel();
     _incomingSessionCompleteSub?.cancel();
+    _incomingSessionFailedSub?.cancel();
     _notifications.dispose();
     _foreground.dispose();
     return super.close();

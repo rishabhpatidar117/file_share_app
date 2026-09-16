@@ -127,6 +127,9 @@ class WebRtcTransport extends TransportChannel {
   Future<void> sendSessionComplete(String sessionId) async {}
 
   @override
+  Future<void> sendSessionFailed(String sessionId, String reason) async {}
+
+  @override
   Future<void> startIncoming() async {
     // Poll the signaling server for inbound session offers.
   }
