@@ -20,7 +20,11 @@ class TransferState {
   final String? errorMessage;
 
   /// Session currently being received from a remote sender.
+  /// Kept as the most recent incoming session for backwards compatibility.
   final TransferSession? incomingSession;
+
+  /// Every incoming session from concurrently connected senders.
+  final List<TransferSession> incomingSessions;
 
   /// Directory where incoming files are being saved.
   final String? saveDirectory;
@@ -43,6 +47,7 @@ class TransferState {
     this.activeChannel,
     this.errorMessage,
     this.incomingSession,
+    this.incomingSessions = const [],
     this.saveDirectory,
     this.incomingError,
     this.networkInfo,
@@ -64,6 +69,7 @@ class TransferState {
     String? errorMessage,
     bool clearError = false,
     TransferSession? incomingSession,
+    List<TransferSession>? incomingSessions,
     String? saveDirectory,
     String? incomingError,
     bool clearIncoming = false,
@@ -79,6 +85,7 @@ class TransferState {
       activeChannel: activeChannel ?? this.activeChannel,
       errorMessage: clearError ? null : (errorMessage ?? this.errorMessage),
       incomingSession: clearIncoming ? null : (incomingSession ?? this.incomingSession),
+      incomingSessions: incomingSessions ?? this.incomingSessions,
       saveDirectory: clearIncoming ? null : (saveDirectory ?? this.saveDirectory),
       incomingError: clearIncomingError ? null : (incomingError ?? this.incomingError),
       networkInfo: networkInfo ?? this.networkInfo,

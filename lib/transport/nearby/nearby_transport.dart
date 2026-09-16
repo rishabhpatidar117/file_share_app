@@ -18,6 +18,7 @@ class NearbyTransport extends TransportChannel {
 
   @override
   void setDeviceName(String name) => _deviceName = name;
+  @override
   String get deviceName => _deviceName;
 
   @override
@@ -50,6 +51,15 @@ class NearbyTransport extends TransportChannel {
     await Future.delayed(const Duration(seconds: 1));
     updateState(TransportState.connected);
   }
+
+  @override
+  List<PeerConnection> get connectedPeers => const [];
+
+  @override
+  Future<void> sendChat(String peerId, String text) async {}
+
+  @override
+  Future<void> sendChatBroadcast(String text) async {}
 
   @override
   Future<void> disconnect() async {
@@ -91,6 +101,7 @@ class NearbyTransport extends TransportChannel {
     String deviceName,
     List<SessionFileMeta> files, {
     int? chunkSize,
+    String? peerId,
   }) async {
     return <int, int>{};
   }
@@ -113,16 +124,16 @@ class NearbyTransport extends TransportChannel {
   Future<void> acceptIncoming(String sessionId, ResumePoints resumePoints) async {}
 
   @override
-  Future<void> sendChunkAck(int fileIndex, int chunkIndex) async {}
+  Future<void> sendChunkAck(String sessionId, int fileIndex, int chunkIndex) async {}
 
   @override
-  Future<void> sendChunkError(int fileIndex, int chunkIndex) async {}
+  Future<void> sendChunkError(String sessionId, int fileIndex, int chunkIndex) async {}
 
   @override
-  Future<void> sendFileCompleteAck(int fileIndex) async {}
+  Future<void> sendFileCompleteAck(String sessionId, int fileIndex) async {}
 
   @override
-  Future<void> sendFileRetry(int fileIndex) async {}
+  Future<void> sendFileRetry(String sessionId, int fileIndex) async {}
 
   @override
   void pause() {

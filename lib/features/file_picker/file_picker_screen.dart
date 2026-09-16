@@ -10,6 +10,8 @@ import '../../core/utils/byte_formatter.dart';
 import '../../core/widgets/glass_card.dart';
 import '../../core/widgets/gradient_background.dart';
 import '../camera/camera_capture_screen.dart';
+import '../discovery/discovery_cubit.dart';
+import '../discovery/discovery_state.dart';
 import '../transfer/transfer_cubit.dart';
 import '../transfer/transfer_screen.dart';
 
@@ -25,6 +27,8 @@ class FilePickerScreen extends StatefulWidget {
 }
 
 class _FilePickerScreenState extends State<FilePickerScreen> {
+  String? _selectedPeerId;
+
   bool get _cameraSupported {
     if (!kIsWeb) {
       switch (defaultTargetPlatform) {
@@ -98,6 +102,51 @@ class _FilePickerScreenState extends State<FilePickerScreen> {
                   ),
                 ),
                 const SizedBox(height: 8),
+                BlocBuilder<DiscoveryCubit, DiscoveryState>(
+                  builder: (context, state) {
+                    final peers = state.connectedPeers;
+                    if (peers.isEmpty) return const SizedBox.shrink();
+                    if (!peers.any((p) => p.deviceId == _selectedPeerId)) {
+                      _selectedPeerId = peers.first.deviceId;
+                    }
+                    final selectedId = _selectedPeerId!;
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 24),
+                      child: Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        alignment: WrapAlignment.center,
+                        children: [
+                          for (final peer in peers)
+                            ChoiceChip(
+                              selected: selectedId == peer.deviceId,
+                              onSelected: (_) =>
+                                  setState(() => _selectedPeerId = peer.deviceId),
+                              avatar: const Icon(
+                                Icons.person,
+                                size: 16,
+                                color: AppColors.primary,
+                              ),
+                              label: Text(
+                                peer.deviceName,
+                                style: AppTextStyles.bodySmall(isDark: isDark),
+                              ),
+                              selectedColor: AppColors.primary.withValues(alpha: 0.18),
+                              backgroundColor: AppColors.primary.withValues(
+                                alpha: isDark ? 0.1 : 0.04,
+                              ),
+                              labelStyle: TextStyle(
+                                color: selectedId == peer.deviceId
+                                    ? AppColors.primary
+                                    : null,
+                              ),
+                            ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+                const SizedBox(height: 8),
                 BlocBuilder<FilePickerCubit, FilePickerState>(
                   builder: (context, state) {
                     if (state.totalSize > 0) {
@@ -155,7 +204,9 @@ class _FilePickerScreenState extends State<FilePickerScreen> {
                   onPressed: state.files.isEmpty
                       ? null
                       : () {
-                          context.read<FilePickerCubit>().startTransfer();
+                          context
+                              .read<FilePickerCubit>()
+                              .startTransfer(peerId: _selectedPeerId);
                           Navigator.pushReplacement(
                             context,
                             MaterialPageRoute(

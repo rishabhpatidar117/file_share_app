@@ -182,7 +182,7 @@ void main() {
 
     receiver.onChunkReceived.listen((event) async {
       receivedParts.add(event.data);
-      await receiver.sendChunkAck(event.fileIndex, event.metadata.index);
+      await receiver.sendChunkAck(event.sessionId, event.fileIndex, event.metadata.index);
       if (gotDataEvent.isCompleted) return;
       gotDataEvent.complete();
     });
@@ -193,7 +193,7 @@ void main() {
       receivedHash = event.sha256;
       expect(event.sha256, sourceHash);
       expect(event.fileName, 'payload.bin');
-      await receiver.sendFileCompleteAck(event.fileIndex);
+      await receiver.sendFileCompleteAck(event.sessionId, event.fileIndex);
       done.complete();
     });
 
@@ -258,7 +258,7 @@ void main() {
 
     // Acknowledge nothing; instead reject the single chunk (bad CRC).
     receiver.onChunkReceived.listen((event) async {
-      await receiver.sendChunkError(event.fileIndex, event.metadata.index);
+      await receiver.sendChunkError(event.sessionId, event.fileIndex, event.metadata.index);
       if (!gotChunk.isCompleted) gotChunk.complete();
     });
 
@@ -372,11 +372,11 @@ void main() {
     });
     receiver.onChunkReceived.listen((event) async {
       receivedByReceiver.add(event.data);
-      await receiver.sendChunkAck(event.fileIndex, event.metadata.index);
+      await receiver.sendChunkAck(event.sessionId, event.fileIndex, event.metadata.index);
     });
     receiver.onIncomingFileComplete.listen((event) async {
       expect(event.sha256, hashA);
-      await receiver.sendFileCompleteAck(event.fileIndex);
+      await receiver.sendFileCompleteAck(event.sessionId, event.fileIndex);
     });
 
     // Sender side (A) also handles B's reverse session over the same socket.
@@ -386,11 +386,11 @@ void main() {
     });
     sender.onChunkReceived.listen((event) async {
       receivedBySender.add(event.data);
-      await sender.sendChunkAck(event.fileIndex, event.metadata.index);
+      await sender.sendChunkAck(event.sessionId, event.fileIndex, event.metadata.index);
     });
     sender.onIncomingFileComplete.listen((event) async {
       expect(event.sha256, hashB);
-      await sender.sendFileCompleteAck(event.fileIndex);
+      await sender.sendFileCompleteAck(event.sessionId, event.fileIndex);
     });
 
     await sender.connectToDevice(const DeviceInfo(
@@ -478,16 +478,16 @@ void main() {
       // (same chunk index) is accepted.
       if (!rejectedOnce) {
         rejectedOnce = true;
-        await receiver.sendChunkError(event.fileIndex, event.metadata.index);
+        await receiver.sendChunkError(event.sessionId, event.fileIndex, event.metadata.index);
       } else {
         receivedData.add(event.data);
-        await receiver.sendChunkAck(event.fileIndex, event.metadata.index);
+        await receiver.sendChunkAck(event.sessionId, event.fileIndex, event.metadata.index);
         if (!gotAll.isCompleted) gotAll.complete();
       }
     });
 
     receiver.onIncomingFileComplete.listen((event) async {
-      await receiver.sendFileCompleteAck(event.fileIndex);
+      await receiver.sendFileCompleteAck(event.sessionId, event.fileIndex);
     });
 
     await sender.connectToDevice(const DeviceInfo(
@@ -547,13 +547,13 @@ void main() {
     receiver.onChunkReceived.listen((event) async {
       deliveryOrder.add(event.metadata.index);
       receivedParts[event.metadata.index] = event.data;
-      await receiver.sendChunkAck(event.fileIndex, event.metadata.index);
+      await receiver.sendChunkAck(event.sessionId, event.fileIndex, event.metadata.index);
       if (receivedParts.length == reader.totalChunks && !gotAll.isCompleted) {
         gotAll.complete();
       }
     });
     receiver.onIncomingFileComplete.listen((event) async {
-      await receiver.sendFileCompleteAck(event.fileIndex);
+      await receiver.sendFileCompleteAck(event.sessionId, event.fileIndex);
     });
 
     await sender.connectToDevice(const DeviceInfo(
@@ -731,10 +731,10 @@ void main() {
     });
     client.onChunkReceived.listen((event) async {
       receivedParts.add(event.data);
-      await client.sendChunkAck(event.fileIndex, event.metadata.index);
+      await client.sendChunkAck(event.sessionId, event.fileIndex, event.metadata.index);
     });
     client.onIncomingFileComplete.listen((event) async {
-      await client.sendFileCompleteAck(event.fileIndex);
+      await client.sendFileCompleteAck(event.sessionId, event.fileIndex);
       done.complete();
     });
 

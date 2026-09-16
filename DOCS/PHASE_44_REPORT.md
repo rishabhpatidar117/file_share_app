@@ -48,11 +48,13 @@ Measured on the pre-Phase-44 codebase (LAN host-to-host / loopback):
 
 ## 3. Results summary
 
-- Correctness: **59/59 tests pass** (was 39 at phase start; +20 new transport tests).
+- Correctness: **64/64 tests pass** (was 59 at phase start; +4 new chat transport tests, +1 broadcast ack).
 - `flutter analyze`: **No issues found**.
 - `flutter build apk --debug`: **SUCCESS** with P2P channels + foreground service manifest.
 - Performance fixes are regression-covered by LAN loopback tests; absolute MB/s numbers
   cannot be produced in this sandbox (see Unverified, §7).
+- **WDCable-sweep additions**: real-time per-peer chat (Hive-persisted), Messages tab, chat
+  entry on discovery connected card, multi-device peer list, per-peer file-send selection.
 
 ## 4. Rates, concurrency and tuning knobs
 
@@ -97,6 +99,14 @@ Diag output on screen / log:
 - `lib/features/transfer/transfer_screen.dart` — transport diagnostics line.
 - `lib/core/di/service_locator.dart` — `TransferForegroundService` singleton + 6-arg `TransferCubit` factory.
 - `lib/core/services/transfer_foreground_service.dart` (new) — idempotent best-effort wrapper.
+- `lib/features/chat/` (new) — `ChatRepository`, `ChatConversation`, `ChatCubit`/`ChatState`, `MessagesScreen`, `ConversationScreen`; Hive `chat_messages` box.
+- `lib/features/discovery/discovery_state.dart` — `connectedPeers` list field + `copyWith` support.
+- `lib/features/discovery/discovery_cubit.dart` — `onPeerList` subscription to populate `connectedPeers`.
+- `lib/features/discovery/discovery_screen.dart` — Chat button on connected card.
+- `lib/features/home/home_screen.dart` — Messages navigation destination (4th tab).
+- `lib/features/file_picker/file_picker_screen.dart` — per-peer send target selector.
+- `lib/features/transfer/transfer_cubit.dart` — multi-session receiver (`Map<String, _IncomingCtx>`), chat + broadcast plumbing.
+- `lib/features/transfer/transfer_state.dart` — `incomingSessions` list field.
 
 ### Android (native)
 - `android/app/src/main/kotlin/com/example/file_share_app/MainActivity.kt` — MethodChannel `swiftshare/wifi_p2p`, EventChannel `swiftshare/wifi_p2p_events`, `swiftshare/transfer_lifecycle`; P2P manager + receivers + group-info watchdog + owner-IP resolution; original link-info logic intact.
@@ -105,6 +115,7 @@ Diag output on screen / log:
 
 ### Tests
 - `test/lan_transport_test.dart` — +1 owner-mode (Wi-Fi Direct group-owner) engine test.
+- `test/chat_transport_test.dart` (new, 4) — chat bidirectional, identity getters, peer list, broadcast.
 - `test/transfer_manager_test.dart` (new, 6), `test/wifi_p2p_client_test.dart` (new, 6), `test/wifi_direct_transport_test.dart` (new, 4).
 
 ## 7. Explicitly unverified (no device / no second peer / no Wi-Fi)
@@ -121,6 +132,6 @@ before claiming production numbers. CI-only gates remain: `flutter analyze`, `fl
 
 ```
 flutter analyze                 → No issues found
-flutter test --timeout 60s      → 59/59 passed
+flutter test --timeout 60s      → 64/64 passed
 flutter build apk --debug       → Built build\app\outputs\flutter-apk\app-debug.apk
 ```

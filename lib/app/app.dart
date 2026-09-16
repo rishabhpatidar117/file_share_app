@@ -8,6 +8,7 @@ import '../features/discovery/discovery_cubit.dart';
 import '../features/transfer/transfer_cubit.dart';
 import '../features/settings/settings_cubit.dart';
 import '../features/history/history_cubit.dart';
+import '../features/chat/chat_cubit.dart';
 
 class SwiftShareApp extends StatelessWidget {
   const SwiftShareApp({super.key});
@@ -20,6 +21,7 @@ class SwiftShareApp extends StatelessWidget {
         BlocProvider(create: (_) => getIt<TransferCubit>()),
         BlocProvider(create: (_) => getIt<SettingsCubit>()),
         BlocProvider(create: (_) => getIt<HistoryCubit>()),
+        BlocProvider(create: (_) => getIt<ChatCubit>()..load()),
       ],
       child: BlocBuilder<SettingsCubit, SettingsState>(
         builder: (context, settingsState) {

@@ -1,4 +1,5 @@
 import '../../transport/device_info.dart';
+import '../../transport/transport_channel.dart';
 
 enum DiscoveryStatus {
   initial,
@@ -20,6 +21,9 @@ class DiscoveryState {
   /// Name of the peer this device is currently linked with, if any.
   final String? connectedPeer;
 
+  /// Every device with a live, handshaked link right now (multi-device).
+  final List<PeerConnection> connectedPeers;
+
   final String? errorMessage;
 
   const DiscoveryState({
@@ -27,6 +31,7 @@ class DiscoveryState {
     this.devices = const [],
     this.selectedDevice,
     this.connectedPeer,
+    this.connectedPeers = const [],
     this.errorMessage,
   });
 
@@ -35,6 +40,7 @@ class DiscoveryState {
     List<DeviceInfo>? devices,
     DeviceInfo? selectedDevice,
     String? connectedPeer,
+    List<PeerConnection>? connectedPeers,
     String? errorMessage,
     bool clearError = false,
     bool clearDevice = false,
@@ -44,6 +50,7 @@ class DiscoveryState {
       devices: devices ?? this.devices,
       selectedDevice: clearDevice ? null : (selectedDevice ?? this.selectedDevice),
       connectedPeer: connectedPeer ?? this.connectedPeer,
+      connectedPeers: connectedPeers ?? this.connectedPeers,
       errorMessage: clearError ? null : (errorMessage ?? this.errorMessage),
     );
   }

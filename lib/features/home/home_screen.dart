@@ -11,6 +11,7 @@ import '../discovery/discovery_screen.dart';
 import '../history/history_cubit.dart';
 import '../history/history_screen.dart';
 import '../settings/settings_screen.dart';
+import '../chat/messages_screen.dart';
 import '../transfer/session/transfer_session.dart';
 import '../transfer/transfer_cubit.dart';
 import '../transfer/transfer_screen.dart';
@@ -80,6 +81,11 @@ class _HomeScreenState extends State<HomeScreen> {
                 label: Text('Home'),
               ),
               NavigationRailDestination(
+                icon: Icon(Icons.chat_bubble_outline),
+                selectedIcon: Icon(Icons.chat_bubble),
+                label: Text('Messages'),
+              ),
+              NavigationRailDestination(
                 icon: Icon(Icons.history_outlined),
                 selectedIcon: Icon(Icons.history),
                 label: Text('History'),
@@ -116,6 +122,11 @@ class _HomeScreenState extends State<HomeScreen> {
             label: 'Home',
           ),
           NavigationDestination(
+            icon: Icon(Icons.chat_bubble_outline),
+            selectedIcon: Icon(Icons.chat_bubble),
+            label: 'Messages',
+          ),
+          NavigationDestination(
             icon: Icon(Icons.history_outlined),
             selectedIcon: Icon(Icons.history),
             label: 'History',
@@ -135,8 +146,10 @@ class _HomeScreenState extends State<HomeScreen> {
       case 0:
         return _HomeContent(isDark: isDark);
       case 1:
-        return const HistoryScreen();
+        return const MessagesScreen();
       case 2:
+        return const HistoryScreen();
+      case 3:
         return const SettingsScreen();
       default:
         return _HomeContent(isDark: isDark);

@@ -69,7 +69,13 @@ class LanSocketTransport extends TransportChannel {
   /// hello/hello_ack handshake has completed.
   final Set<Socket> _peerSockets = {};
   final Map<Socket, String> _peerNames = {};
+  final Map<Socket, String> _peerIds = {};
   final Set<Socket> _pendingConnections = {};
+
+  /// Device ids expected for sockets that we initiated a connection to, kept
+  /// until the handshake resolves so ack keys work even before the peer's id
+  /// arrives in hello_ack.
+  final Map<Socket, String> _pendingConnectionIds = {};
 
   /// Protocol version each peer reports during the hello handshake.
   final Map<Socket, int> _peerVersions = {};
@@ -89,19 +95,36 @@ class LanSocketTransport extends TransportChannel {
   bool _listening = false;
   bool _discovering = false;
 
-  // Sender-side futures awaiting receiver acks.
+  // Sender-side futures awaiting receiver acks. Keys carry the peer id so
+  // concurrent broadcasts to several devices never collide on the same
+  // file/chunk slot.
   final Map<String, Completer<void>> _chunkAckWaiters = {};
-  final Map<int, Completer<void>> _fileAckWaiters = {};
-  Completer<ResumePoints>? _sessionStartWaiter;
+  final Map<String, Completer<void>> _fileAckWaiters = {};
+  final Map<String, Completer<ResumePoints>> _sessionStartWaiters = {};
   final Map<int, int> _resumePoints = {};
 
-  // Receiver-side state.
-  String? _activeIncomingSessionId;
-  Socket? _incomingSocket;
-  String _remoteDeviceName = 'Unknown';
+  /// Outgoing sessions currently being sent, keyed by session id. Each maps to
+  /// the sockets of every peer that session was broadcast to.
+  final Map<String, List<Socket>> _outgoingSessionSockets = {};
+
+  /// The session id most recently started via [sendSessionStart]. Chunk and
+  /// file frames are stamped with it so a receiver juggling several concurrent
+  /// inbound sessions can route acks back to the right sender link.
+  String _activeOutgoingSessionId = '';
+
+  // Receiver-side state. Multiple devices can send to this one concurrently,
+  // so each session routes to the socket it is arriving on.
+  final Map<String, Socket> _incomingSessionSockets = {};
+  final Map<String, String> _incomingSessionNames = {};
 
   @override
   void setDeviceName(String name) => _deviceName = name;
+
+  @override
+  String get deviceId => _instanceId;
+
+  @override
+  String get deviceName => _deviceName;
 
   // ---------------------------------------------------------------------------
   // Discovery
@@ -263,10 +286,14 @@ class LanSocketTransport extends TransportChannel {
         timeout: const Duration(seconds: 10),
       );
       _connectedSocket = socket;
-      _remoteDeviceName = device.name;
+      // Remember the expected peer id before the handshake arrives, so the
+      // ack keys / connected-peers list are correct even if the remote never
+      // reports an id in its hello_ack.
+      _pendingConnectionIds[socket] = device.id;
       _setupDataListener(socket);
       await _sendMessage(socket, {
         'type': 'hello',
+        'id': _instanceId,
         'name': _deviceName,
         'platform': _platformString,
         'kind': _kind.name,
@@ -280,18 +307,19 @@ class LanSocketTransport extends TransportChannel {
 
   /// Marks a socket as a live, handshaked peer. Emits the peer-connected signal
   /// and moves the transport to `connected` the first time a peer link exists.
-  void _establishPeer(Socket socket, String name) {
+  void _establishPeer(Socket socket, String name, {String? id}) {
     final firstPeer = _peerSockets.isEmpty;
     _peerSockets.add(socket);
     _peerNames[socket] = name;
+    if (id != null && id.isNotEmpty) _peerIds[socket] = id;
     _pendingConnections.remove(socket);
-    _remoteDeviceName = name;
     if (firstPeer) {
       updateState(TransportState.connected);
-      peerConnectedController.add(PeerConnection(deviceName: name));
-    } else if (state != TransportState.connected) {
-      updateState(TransportState.connected);
     }
+    final peerId = _peerIds[socket] ?? _pendingConnectionIds.remove(socket) ?? name;
+    _peerIds[socket] = peerId;
+    peerConnectedController.add(PeerConnection(deviceName: name, deviceId: peerId));
+    _emitPeerList();
   }
 
   /// Removes a socket from all peer bookkeeping. Emits the peer-disconnected
@@ -299,19 +327,57 @@ class LanSocketTransport extends TransportChannel {
   /// link is gone.
   void _removePeer(Socket socket) {
     final wasPeer = _peerSockets.remove(socket);
-    _peerNames.remove(socket);
+    final name = _peerNames.remove(socket);
+    final id = _peerIds.remove(socket);
+    _pendingConnectionIds.remove(socket);
     _peerVersions.remove(socket);
     _pendingConnections.remove(socket);
     _receivers.remove(socket);
     _writers.remove(socket);
+    _incomingSessionSockets.removeWhere((_, s) => identical(s, socket));
+    _incomingSessionNames.removeWhere((_, s) => identical(s, socket));
     if (identical(socket, _connectedSocket)) _connectedSocket = null;
-    if (identical(socket, _incomingSocket)) _incomingSocket = null;
+
+    // Fail any acks that were pending on this socket so the sender's chunk /
+    // file futures stop hanging once a peer drops mid-transfer.
+    _failWaitersForSocket(socket);
+
     if (!wasPeer) return;
     if (_peerSockets.isEmpty) {
-      if (_peerNames.isNotEmpty) _peerNames.clear();
-      peerDisconnectedController.add(_remoteDeviceName);
+      peerDisconnectedController.add(name ?? id ?? '');
+      _emitPeerList();
       updateState(_listening ? TransportState.listening : TransportState.disconnected);
+    } else {
+      _emitPeerList();
     }
+  }
+
+  void _emitPeerList() {
+    peerListController.add([
+      for (final s in _peerSockets)
+        PeerConnection(
+          deviceName: _peerNames[s] ?? 'peer',
+          deviceId: _peerIds[s] ?? '',
+        ),
+    ]);
+  }
+
+  /// Completes-with-error every chunk/file/session waiter keyed to a socket.
+  void _failWaitersForSocket(Socket socket) {
+    final key = _socketKeys[socket];
+    if (key == null) return;
+    final prefix = '$key:';
+    _chunkAckWaiters.removeWhere((waiterKey, w) {
+      if (!waiterKey.startsWith(prefix)) return false;
+      if (!w.isCompleted) w.completeError(TransportException('Peer disconnected'));
+      return true;
+    });
+    _fileAckWaiters.removeWhere((waiterKey, w) {
+      if (!waiterKey.startsWith(prefix)) return false;
+      if (!w.isCompleted) w.completeError(TransportException('Peer disconnected'));
+      return true;
+    });
+    _sessionStartWaiters.remove(key)?.complete(_resumePoints);
   }
 
   Future<void> _closePeerSocket(Socket socket) async {
@@ -431,9 +497,11 @@ class LanSocketTransport extends TransportChannel {
     switch (type) {
       case 'hello':
         _peerVersions[socket] = (message['ver'] as int?) ?? 1;
-        _establishPeer(socket, message['name'] as String? ?? 'Unknown');
+        _establishPeer(socket, message['name'] as String? ?? 'Unknown',
+            id: message['id'] as String?);
         _sendMessage(socket, {
           'type': 'hello_ack',
+          'id': _instanceId,
           'name': _deviceName,
           'platform': _platformString,
           'kind': _kind.name,
@@ -443,7 +511,8 @@ class LanSocketTransport extends TransportChannel {
 
       case 'hello_ack':
         _peerVersions[socket] = (message['ver'] as int?) ?? 1;
-        _establishPeer(socket, message['name'] as String? ?? 'Unknown');
+        _establishPeer(socket, message['name'] as String? ?? 'Unknown',
+            id: message['id'] as String?);
         break;
 
       case 'disconnect':
@@ -451,16 +520,17 @@ class LanSocketTransport extends TransportChannel {
         break;
 
       case 'session_start':
-        _activeIncomingSessionId = message['sessionId'];
-        _remoteDeviceName = message['deviceName'] ?? _remoteDeviceName;
-        _incomingSocket = socket;
+        final sessionId = message['sessionId'] as String? ?? '';
+        final deviceName = message['deviceName'] as String? ?? 'Unknown';
+        _incomingSessionSockets[sessionId] = socket;
+        _incomingSessionNames[sessionId] = deviceName;
         final chunkSize = message['chunkSize'] as int? ?? 512 * 1024;
         final files = (message['files'] as List)
             .map((f) => SessionFileMeta.fromJson(f))
             .toList();
         incomingSessionController.add(IncomingSession(
-          sessionId: _activeIncomingSessionId!,
-          remoteDeviceName: _remoteDeviceName,
+          sessionId: sessionId,
+          remoteDeviceName: deviceName,
           files: files,
           chunkSize: chunkSize,
         ));
@@ -468,19 +538,22 @@ class LanSocketTransport extends TransportChannel {
 
       case 'session_ack':
         final received = message['received'];
+        final waiterKey = _peerKey(socket);
+        _resumePoints.clear();
+        _resumePoints.clear();
         if (received is Map) {
-          _resumePoints.clear();
           received.forEach((k, v) => _resumePoints[int.parse('$k')] = v as int);
         }
-        _sessionStartWaiter?.complete(_resumePoints);
-        _sessionStartWaiter = null;
+        _sessionStartWaiters.remove(waiterKey)?.complete(_resumePoints);
         break;
 
       case 'chunk':
+        final sessionId = message['sessionId'] as String? ?? '';
         final fileIndex = message['fileIndex'] as int;
         final metadata = ChunkMetadata.fromJson(message['metadata']);
         final data = chunkPayload ?? base64Decode(message['data'] as String);
         chunkReceivedController.add(ChunkReceivedEvent(
+          sessionId: sessionId,
           fileIndex: fileIndex,
           metadata: metadata,
           data: data,
@@ -488,12 +561,20 @@ class LanSocketTransport extends TransportChannel {
         break;
 
       case 'chunk_ack':
-        final key = _chunkKey(message['fileIndex'], message['chunkIndex']);
+        final key = _chunkKey(
+          _peerKey(socket),
+          message['fileIndex'] as int,
+          message['chunkIndex'] as int,
+        );
         _chunkAckWaiters.remove(key)?.complete();
         break;
 
       case 'chunk_error':
-        final key = _chunkKey(message['fileIndex'], message['chunkIndex']);
+        final key = _chunkKey(
+          _peerKey(socket),
+          message['fileIndex'] as int,
+          message['chunkIndex'] as int,
+        );
         _chunkAckWaiters.remove(key)?.completeError(
           TransportException('Receiver rejected chunk '
               '${message['fileIndex']}:${message['chunkIndex']}'),
@@ -502,7 +583,7 @@ class LanSocketTransport extends TransportChannel {
 
       case 'file_complete':
         incomingFileCompleteController.add(IncomingFileComplete(
-          sessionId: _activeIncomingSessionId ?? '',
+          sessionId: message['sessionId'] as String? ?? '',
           fileIndex: message['fileIndex'] as int,
           fileName: message['name'] ?? '',
           fileSize: message['size'] ?? 0,
@@ -512,18 +593,28 @@ class LanSocketTransport extends TransportChannel {
         break;
 
       case 'file_complete_ack':
-        _fileAckWaiters.remove(message['fileIndex'] as int)?.complete();
+        _fileAckWaiters
+            .remove(_fileKey(_peerKey(socket), message['fileIndex'] as int))
+            ?.complete();
         break;
 
       case 'file_retry':
         final fileIndex = message['fileIndex'] as int;
-        _fileAckWaiters.remove(fileIndex)?.completeError(
+        _fileAckWaiters
+            .remove(_fileKey(_peerKey(socket), fileIndex))
+            ?.completeError(
           TransportException('Receiver requested a resend of file $fileIndex'),
         );
         break;
 
       case 'session_complete':
-        incomingSessionCompleteController.add(null);
+        incomingSessionCompleteController.add(
+          message['sessionId'] as String? ?? '',
+        );
+        break;
+
+      case 'chat_msg':
+        chatReceivedController.add(ChatMessage.fromJson(message));
         break;
 
       case 'session_failed':
@@ -535,7 +626,25 @@ class LanSocketTransport extends TransportChannel {
     }
   }
 
-  String _chunkKey(int fileIndex, int chunkIndex) => '$fileIndex:$chunkIndex';
+  String _chunkKey(String peer, int fileIndex, int chunkIndex) =>
+      '$peer:$fileIndex:$chunkIndex';
+
+  String _fileKey(String peer, int fileIndex) => '$peer:$fileIndex';
+
+  /// Per-socket stable identity used to key ack waiters. Set the moment a socket
+  /// is first seen, so the key a waiter is registered under and the key a reply
+  /// arrives under are identical even if the hello handshake lands between the
+  /// two events. Reply and waiter always live on the same local socket, so the
+  /// value only needs to be stable within this transport.
+  final Map<Socket, String> _socketKeys = {};
+  int _socketKeyCounter = 0;
+
+  String _socketKeyFor(Socket socket) =>
+      _socketKeys[socket] ??= 'peer${_socketKeyCounter++}@${socket.remoteAddress.address}';
+
+  /// The identity used to key acks: stable per-socket token (device id when
+  /// known, otherwise a local serial per remote address).
+  String _peerKey(Socket socket) => _socketKeyFor(socket);
 
   /// Serializes a JSON control frame onto the socket's coalescing writer.
   Future<void> _sendMessage(Socket socket, Map<String, dynamic> message) async {
@@ -552,10 +661,12 @@ class LanSocketTransport extends TransportChannel {
   /// Builds a v2 binary chunk frame:
   ///   [uint32 len]['SSCH'][uint32 metaLen][utf8(json meta)][raw payload]
   Uint8List _encodeBinaryChunkFrame(
-      int fileIndex, ChunkMetadata metadata, Uint8List data) {
+      int fileIndex, ChunkMetadata metadata, Uint8List data,
+      {String sessionId = ''}) {
     final meta = utf8.encode(json.encode({
       'type': 'chunk',
       'fileIndex': fileIndex,
+      'sessionId': sessionId,
       'metadata': metadata.toJson(),
     }));
     final bodyLen = 4 + 4 + meta.length + data.length;
@@ -575,9 +686,10 @@ class LanSocketTransport extends TransportChannel {
   // Sender API
   // ---------------------------------------------------------------------------
 
-  /// The socket used to push our outgoing sessions. Prefers the socket this
-  /// device initiated; otherwise falls back to a peer socket we accepted, so a
-  /// receiver can send files back across the same established link.
+  /// The socket used to push our outgoing sessions to the primary peer. When
+  /// multiple peers are connected, [sendChunk]/[sendFileComplete] fall back to
+  /// this; callers that want broadcast can pass target socket lists in the
+  /// overloaded transport-level senders later.
   Socket get _senderSocket {
     if (_connectedSocket != null) return _connectedSocket!;
     if (_peerSockets.isNotEmpty) return _peerSockets.first;
@@ -585,19 +697,71 @@ class LanSocketTransport extends TransportChannel {
   }
 
   @override
+  Future<void> sendChat(String peerId, String text) async {
+    final socket = _socketForPeerId(peerId);
+    if (socket == null) return;
+    await _sendMessage(socket, ChatMessage(
+      id: DateTime.now().microsecondsSinceEpoch.toRadixString(16),
+      text: text,
+      senderId: _instanceId,
+      senderName: _deviceName,
+      timestamp: DateTime.now(),
+    ).toJson());
+  }
+
+  @override
+  Future<void> sendChatBroadcast(String text) async {
+    final msg = ChatMessage(
+      id: DateTime.now().microsecondsSinceEpoch.toRadixString(16),
+      text: text,
+      senderId: _instanceId,
+      senderName: _deviceName,
+      timestamp: DateTime.now(),
+    );
+    for (final socket in _peerSockets) {
+      try { _sendMessage(socket, msg.toJson()); } catch (_) {}
+    }
+  }
+
+  /// Resolves a peer id to the live socket of that peer, or null.
+  Socket? _socketForPeerId(String peerId) {
+    for (final s in _peerSockets) {
+      if (_peerIds[s] == peerId) return s;
+    }
+    return null;
+  }
+
+  @override
+  List<PeerConnection> get connectedPeers => [
+    for (final s in _peerSockets)
+      PeerConnection(
+        deviceName: _peerNames[s] ?? 'peer',
+        deviceId: _peerIds[s] ?? '',
+      ),
+  ];
+
+  @override
   Future<ResumePoints> sendSessionStart(
     String sessionId,
     String deviceName,
     List<SessionFileMeta> files, {
     int? chunkSize,
+    String? peerId,
   }) async {
-    final socket = _senderSocket;
+    final socket = peerId == null ? _senderSocket : _socketForPeerId(peerId);
+    if (socket == null) {
+      throw TransportException('Peer $peerId not connected');
+    }
+    _activeOutgoingSessionId = sessionId;
+    _outgoingSessionSockets[sessionId] = [socket];
     debugPrint(
       '[TRANSFER] session=$sessionId remote=${socket.remoteAddress.address} '
       'files=${files.length} ver=${_peerVersions[socket] ?? 1}',
     );
     final completer = Completer<ResumePoints>();
-    _sessionStartWaiter = completer;
+    _sessionStartWaiters[_peerKey(socket)] = completer;
+    _activeOutgoingSessionId = sessionId;
+    _outgoingSessionSockets[sessionId] = [socket];
     await _sendMessage(socket, {
       'type': 'session_start',
       'sessionId': sessionId,
@@ -613,20 +777,23 @@ class LanSocketTransport extends TransportChannel {
 
   @override
   Future<void> sendChunk(int fileIndex, ChunkMetadata metadata, Uint8List data) async {
-    final socket = _senderSocket;
+    final socket = _activeOutgoingSessionSocket ?? _senderSocket;
     updateState(TransportState.transferring);
+    final sessionId = _activeOutgoingSessionId;
 
-    final key = _chunkKey(fileIndex, metadata.index);
+    final key = _chunkKey(_peerKey(socket), fileIndex, metadata.index);
     final completer = Completer<void>();
     _chunkAckWaiters[key] = completer;
 
     if ((_peerVersions[socket] ?? 1) >= _protocolVersion) {
-      final frame = _encodeBinaryChunkFrame(fileIndex, metadata, data);
+      final frame = _encodeBinaryChunkFrame(fileIndex, metadata, data,
+          sessionId: sessionId);
       await _writerFor(socket).write(frame);
     } else {
       await _sendMessage(socket, {
         'type': 'chunk',
         'fileIndex': fileIndex,
+        'sessionId': sessionId,
         'metadata': metadata.toJson(),
         'data': base64Encode(data),
       });
@@ -635,7 +802,7 @@ class LanSocketTransport extends TransportChannel {
       const Duration(seconds: 30),
       onTimeout: () {
         _chunkAckWaiters.remove(key);
-        throw TransportException('Chunk $metadata.index timed out');
+        throw TransportException('Chunk ${metadata.index} timed out');
       },
     );
   }
@@ -648,16 +815,19 @@ class LanSocketTransport extends TransportChannel {
     int fileSize = 0,
     int totalChunks = 0,
   }) async {
-    final socket = _senderSocket;
+    final socket = _activeOutgoingSessionSocket ?? _senderSocket;
+    final sessionId = _activeOutgoingSessionId;
     debugPrint(
       '[TRANSFER] file_complete file=$fileIndex size=$fileSize '
       'chunks=$totalChunks',
     );
+    final key = _fileKey(_peerKey(socket), fileIndex);
     final completer = Completer<void>();
-    _fileAckWaiters[fileIndex] = completer;
+    _fileAckWaiters[key] = completer;
     await _sendMessage(socket, {
       'type': 'file_complete',
       'fileIndex': fileIndex,
+      'sessionId': sessionId,
       'hash': fileHash,
       'name': fileName,
       'size': fileSize,
@@ -666,15 +836,24 @@ class LanSocketTransport extends TransportChannel {
     await completer.future.timeout(
       const Duration(seconds: 180),
       onTimeout: () {
-        _fileAckWaiters.remove(fileIndex);
+        _fileAckWaiters.remove(key);
         throw TransportException('File $fileIndex completion timed out');
       },
     );
   }
 
+  /// The socket a currently-active outgoing session is pinned to, if any.
+  Socket? get _activeOutgoingSessionSocket {
+    final sockets = _outgoingSessionSockets[_activeOutgoingSessionId];
+    return (sockets == null || sockets.isEmpty) ? null : sockets.first;
+  }
+
   @override
   Future<void> sendSessionComplete(String sessionId) async {
-    final socket = _senderSocket;
+    final sockets = _outgoingSessionSockets[sessionId];
+    final socket = (sockets == null || sockets.isEmpty)
+        ? _senderSocket
+        : sockets.first;
     await _sendMessage(socket, {
       'type': 'session_complete',
       'sessionId': sessionId,
@@ -685,14 +864,10 @@ class LanSocketTransport extends TransportChannel {
   Future<void> sendSessionFailed(String sessionId, String reason) async {
     // Works from either direction: the receiver sends over the socket it
     // accepted, the sender sends over the socket it initiated (or any peer).
-    Socket? socket;
-    if (_incomingSocket != null) {
-      socket = _incomingSocket;
-    } else if (_connectedSocket != null) {
-      socket = _connectedSocket;
-    } else if (_peerSockets.isNotEmpty) {
-      socket = _peerSockets.first;
-    }
+    Socket? socket = _incomingSessionSockets[sessionId];
+    socket ??= _activeOutgoingSessionSocket;
+    socket ??= _connectedSocket;
+    socket ??= _peerSockets.isNotEmpty ? _peerSockets.first : null;
     if (socket == null) return;
     await _sendMessage(socket, {
       'type': 'session_failed',
@@ -707,7 +882,7 @@ class LanSocketTransport extends TransportChannel {
 
   @override
   Future<void> acceptIncoming(String sessionId, ResumePoints resumePoints) async {
-    final socket = _incomingSocket;
+    final socket = _incomingSessionSockets[sessionId];
     if (socket == null) return;
     await _sendMessage(socket, {
       'type': 'session_ack',
@@ -717,8 +892,8 @@ class LanSocketTransport extends TransportChannel {
   }
 
   @override
-  Future<void> sendChunkAck(int fileIndex, int chunkIndex) async {
-    final socket = _incomingSocket;
+  Future<void> sendChunkAck(String sessionId, int fileIndex, int chunkIndex) async {
+    final socket = _incomingSessionSockets[sessionId];
     if (socket == null) return;
     await _sendMessage(socket, {
       'type': 'chunk_ack',
@@ -728,8 +903,8 @@ class LanSocketTransport extends TransportChannel {
   }
 
   @override
-  Future<void> sendChunkError(int fileIndex, int chunkIndex) async {
-    final socket = _incomingSocket;
+  Future<void> sendChunkError(String sessionId, int fileIndex, int chunkIndex) async {
+    final socket = _incomingSessionSockets[sessionId];
     if (socket == null) return;
     await _sendMessage(socket, {
       'type': 'chunk_error',
@@ -739,8 +914,8 @@ class LanSocketTransport extends TransportChannel {
   }
 
   @override
-  Future<void> sendFileCompleteAck(int fileIndex) async {
-    final socket = _incomingSocket;
+  Future<void> sendFileCompleteAck(String sessionId, int fileIndex) async {
+    final socket = _incomingSessionSockets[sessionId];
     if (socket == null) return;
     await _sendMessage(socket, {
       'type': 'file_complete_ack',
@@ -749,8 +924,8 @@ class LanSocketTransport extends TransportChannel {
   }
 
   @override
-  Future<void> sendFileRetry(int fileIndex) async {
-    final socket = _incomingSocket;
+  Future<void> sendFileRetry(String sessionId, int fileIndex) async {
+    final socket = _incomingSessionSockets[sessionId];
     if (socket == null) return;
     await _sendMessage(socket, {
       'type': 'file_retry',
@@ -781,9 +956,10 @@ class LanSocketTransport extends TransportChannel {
       await _closePeerSocket(s);
     }
     _connectedSocket = null;
-    _incomingSocket = null;
-    _activeIncomingSessionId = null;
-    _sessionStartWaiter = null;
+    _incomingSessionSockets.clear();
+    _incomingSessionNames.clear();
+    _sessionStartWaiters.clear();
+    _outgoingSessionSockets.clear();
     if (state != TransportState.disconnected && state != TransportState.connecting) {
       updateState(_listening ? TransportState.listening : TransportState.disconnected);
     }
@@ -805,17 +981,21 @@ class LanSocketTransport extends TransportChannel {
     }
     _connectedSocket = null;
     _pendingConnections.clear();
+    _pendingConnectionIds.clear();
     _peerSockets.clear();
     _peerNames.clear();
+    _peerIds.clear();
     _peerVersions.clear();
     _receivers.clear();
     _writers.clear();
-    _incomingSocket = null;
-    _activeIncomingSessionId = null;
+    _incomingSessionSockets.clear();
+    _incomingSessionNames.clear();
     await stopIncoming();
     await stopDiscovery();
     _chunkAckWaiters.clear();
     _fileAckWaiters.clear();
+    _sessionStartWaiters.clear();
+    _outgoingSessionSockets.clear();
     updateState(TransportState.disconnected);
   }
 

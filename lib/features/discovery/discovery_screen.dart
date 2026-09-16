@@ -15,11 +15,13 @@ import '../../core/widgets/glass_toast.dart';
 import '../../core/widgets/gradient_background.dart';
 import '../../transport/device_info.dart';
 import '../../transport/qr_connect_payload.dart';
-import '../../transport/transport_channel.dart' show kSwiftShareServicePort;
+import '../../transport/transport_channel.dart'
+    show PeerConnection, kSwiftShareServicePort;
 import '../settings/settings_cubit.dart';
 import '../transfer/transfer_cubit.dart';
 import '../transfer/transfer_state.dart';
 import '../transfer/session/transfer_session.dart';
+import '../chat/conversation_screen.dart';
 import '../file_picker/file_picker_screen.dart';
 
 class DiscoveryScreen extends StatefulWidget {
@@ -118,7 +120,9 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
               BlocBuilder<DiscoveryCubit, DiscoveryState>(
                 builder: (context, state) {
                   if (state.status == DiscoveryStatus.connected) {
-                    return _buildConnectedCard(state.connectedPeer, isDark);
+                    final primary =
+                        state.connectedPeers.isNotEmpty ? state.connectedPeers.first : null;
+                    return _buildConnectedCard(primary, isDark);
                   }
                   if (state.status == DiscoveryStatus.error) {
                     return _buildErrorState(state.errorMessage, isDark);
@@ -268,7 +272,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     );
   }
 
-Widget _buildConnectedCard(String? peerName, bool isDark) {
+Widget _buildConnectedCard(PeerConnection? peer, bool isDark) {
     final count = widget.initialFilePaths.length;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 4),
@@ -297,13 +301,13 @@ Widget _buildConnectedCard(String? peerName, bool isDark) {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Connected to ${peerName ?? "device"}',
+                        'Connected to ${peer?.deviceName ?? "device"}',
                         style: AppTextStyles.heading3(isDark: isDark),
                         overflow: TextOverflow.ellipsis,
                       ),
                       const SizedBox(height: 2),
                       Text(
-                        'You can now send or receive files',
+                        'You can now send, receive or chat',
                         style: AppTextStyles.bodySmall(isDark: isDark),
                       ),
                     ],
@@ -324,6 +328,26 @@ Widget _buildConnectedCard(String? peerName, bool isDark) {
                     style: FilledButton.styleFrom(
                       backgroundColor: AppColors.primary,
                       foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: peer == null
+                        ? null
+                        : () => _openChat(peer),
+                    icon: const Icon(Icons.chat_bubble_outline, size: 18),
+                    label: const Text('Chat'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppColors.primary,
+                      side: BorderSide(
+                        color: AppColors.primary.withValues(alpha: 0.5),
+                      ),
                       padding: const EdgeInsets.symmetric(vertical: 12),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(14),
@@ -356,6 +380,18 @@ Widget _buildConnectedCard(String? peerName, bool isDark) {
               ],
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  void _openChat(PeerConnection peer) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ConversationScreen(
+          peerId: peer.deviceId,
+          peerName: peer.deviceName,
         ),
       ),
     );

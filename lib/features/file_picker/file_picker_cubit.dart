@@ -120,8 +120,8 @@ class FilePickerCubit extends Cubit<FilePickerState> {
     emit(const FilePickerState());
   }
 
-  void startTransfer() {
+  void startTransfer({String? peerId}) {
     if (state.files.isEmpty) return;
-    _transferCubit.startTransfer(state.files);
+    _transferCubit.startTransfer(state.files, peerId: peerId);
   }
 }

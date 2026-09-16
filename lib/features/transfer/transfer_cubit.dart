@@ -73,38 +73,23 @@ class TransferCubit extends Cubit<TransferState> {
   /// Most recent average chunk round-trip latency, for the diagnostics log.
   int _lastAckLatencyMicros = 0;
 
-  // Receiver state.
-  TransferSession? _incoming;
-  String? _incomingSaveDir;
-  int _incomingChunkSize = 512 * 1024;
-  final Map<int, RandomAccessFile> _incomingRafs = {};
-  String? _incomingSessionId;
-  DateTime _lastIncomingUiEmit = DateTime.fromMillisecondsSinceEpoch(0);
-
-  /// Serializes disk writes per file so concurrent inbound chunks can never
-  /// interleave offsets on the same RandomAccessFile.
-  final Map<int, Future<void>> _incomingWriteChains = {};
-
-  /// Number of contiguous chunks ([0, n)) already flushed to disk per file.
-  /// Never recedes, so progress and resume points stay accurate even with
-  /// out-of-order retransmits.
-  final Map<int, int> _incomingContiguousChunks = {};
-
-  /// Chunks accepted from the wire but not yet writable because a lower index
-  /// is still being retransmitted. Bounded by the sender's in-flight window.
-  final Map<int, Map<int, Uint8List>> _incomingPendingChunks = {};
-
-  /// Bytes written to each part file since the last forced flush().
-  final Map<int, int> _incomingFlushDebt = {};
-
   /// Files a whole-file resend is in progress for; such files always restart
   /// at chunk 0 regardless of previously acked progress.
   final Set<int> _forcedRestartFiles = {};
 
-  /// Consecutive whole-file resend (file_retry) requests sent per file index.
-  /// A resend that keeps failing past this limit is escalated to a session
-  /// failure on both ends so neither side is left stuck retrying forever.
-  final Map<int, int> _fileRetryCount = {};
+  // Receiver state. Multiple devices can send to us concurrently, so every
+  // piece of receive bookkeeping is keyed by session id.
+  final Map<String, _IncomingCtx> _incomingCtxs = {};
+
+  /// Directory where incoming files are being saved.
+  String? _incomingSaveDir;
+
+  /// The most recently started incoming session, kept for backwards
+  /// compatibility with single-session UI reads.
+  TransferSession? get _incoming {
+    if (_incomingCtxs.isEmpty) return null;
+    return _incomingCtxs.values.last.session;
+  }
 
   TransferCubit(
     this._transport,
@@ -120,7 +105,7 @@ class TransferCubit extends Cubit<TransferState> {
         try {
           _transport.sendSessionFailed(request.sessionId, 'Incoming session failed: $e');
         } catch (_) {}
-        return _failIncomingSession('Incoming session failed: $e');
+        return _failIncomingSession(request.sessionId, 'Incoming session failed: $e');
       }),
     );
     _incomingChunkSub =
@@ -128,7 +113,7 @@ class TransferCubit extends Cubit<TransferState> {
     _incomingFileCompleteSub =
         _transport.onIncomingFileComplete.listen(_onIncomingFileComplete);
     _incomingSessionCompleteSub =
-        _transport.onIncomingSessionComplete.listen((_) => _onIncomingSessionComplete());
+        _transport.onIncomingSessionComplete.listen((sessionId) => _onIncomingSessionComplete(sessionId));
     _incomingSessionFailedSub =
         _transport.onSessionFailed.listen(_onSessionFailed);
   }
@@ -157,10 +142,13 @@ class TransferCubit extends Cubit<TransferState> {
       ));
       return;
     }
-    final activeIncoming = _incoming;
+    final activeIncoming = _incomingCtxs[failure.sessionId]?.session;
     if (activeIncoming != null &&
         activeIncoming.id == failure.sessionId) {
-      unawaited(_failIncomingSession('Sender aborted: ${failure.reason}'));
+      unawaited(_failIncomingSession(
+        failure.sessionId,
+        'Sender aborted: ${failure.reason}',
+      ));
     }
   }
 
@@ -187,10 +175,13 @@ void _onTransportStateChanged(TransportState transportState) {
   // A live incoming session has no "pause later" option: if the link dies mid
   // receive, fail the session on this side too, so the receiver never stays
   // "Waiting" while the sender has already failed.
-  if (_incoming != null &&
+  if (_incomingCtxs.isNotEmpty &&
       (transportState == TransportState.disconnected ||
           transportState == TransportState.error)) {
-    unawaited(_failIncomingSession('Connection lost while receiving.'));
+    unawaited(_failIncomingSession(
+      _incomingCtxs.keys.first,
+      'Connection lost while receiving.',
+    ));
     return;
   }
 
@@ -232,7 +223,7 @@ void _onTransportStateChanged(TransportState transportState) {
   // Sender flow
   // ---------------------------------------------------------------------------
 
-  Future<void> startTransfer(List<PickedFile> files) async {
+  Future<void> startTransfer(List<PickedFile> files, {String? peerId}) async {
     final sessionId = const Uuid().v4();
     final chunkSize = _chunkSize;
     final manifests = files.map((f) => TransferFileManifest(
@@ -269,6 +260,7 @@ void _onTransportStateChanged(TransportState transportState) {
         _deviceName,
         meta,
         chunkSize: chunkSize,
+        peerId: peerId,
       );
       _resumePoints = Map.from(resume);
     } catch (e) {
@@ -790,16 +782,14 @@ Future<void> _logTransportDecision() async {
     _isPaused = true;
     _transport.disconnect();
     _notifications.cancelTransferNotification();
-    for (final raf in _incomingRafs.values) {
-      try {
-        raf.closeSync();
-      } catch (_) {}
+    for (final ctx in _incomingCtxs.values) {
+      for (final raf in ctx.rafs.values) {
+        try {
+          raf.closeSync();
+        } catch (_) {}
+      }
     }
-    _incomingRafs.clear();
-    _incomingWriteChains.clear();
-    _incomingPendingChunks.clear();
-    _incomingContiguousChunks.clear();
-    _incomingSessionId = null;
+    _incomingCtxs.clear();
 
     emit(const TransferState());
   }
@@ -832,27 +822,15 @@ Future<void> _logTransportDecision() async {
         files: manifests,
         createdAt: DateTime.now(),
       );
-      _incoming = incoming;
-      _incomingSaveDir = saveDir;
-      _incomingChunkSize = request.chunkSize > 0 ? request.chunkSize : _chunkSize;
 
-      // Reset all receiver bookkeeping when a genuinely new session arrives.
-      // When the same session is re-negotiated (pause/resume) the warm prefix
-      // maps are kept so we don't need to re-verify data already on disk.
-      if (_incomingSessionId != request.sessionId) {
-        _incomingSessionId = request.sessionId;
-        for (final raf in _incomingRafs.values) {
-          try {
-            await raf.close();
-          } catch (_) {}
-        }
-        _incomingRafs.clear();
-        _incomingWriteChains.clear();
-        _incomingPendingChunks.clear();
-        _incomingContiguousChunks.clear();
-        _incomingFlushDebt.clear();
-        _fileRetryCount.clear();
-      }
+      final ctx = _IncomingCtx(
+        session: incoming,
+        saveDir: saveDir,
+        chunkSize: request.chunkSize > 0 ? request.chunkSize : _chunkSize,
+      );
+      // Re-negotiating the same session (resume) reuses the warm prefix maps;
+      // a genuinely new, distinct session gets a fresh ctx.
+      _incomingCtxs[request.sessionId] = ctx;
 
       // Resume from the contiguous on-disk prefix when available (accurate
       // for both offset-based retransmits and sequential writes).  Fall back
@@ -861,7 +839,7 @@ Future<void> _logTransportDecision() async {
       final resume = <int, int>{};
       for (var i = 0; i < request.files.length; i++) {
         final manifest = manifests[i];
-        final warmPrefix = _incomingContiguousChunks[i];
+        final warmPrefix = ctx.contiguousChunks[i];
         if (warmPrefix != null && warmPrefix > 0) {
           // The sender starts at the reported index, so reporting a fully
           // received file (== totalChunks) makes it skip straight to the
@@ -871,7 +849,7 @@ Future<void> _logTransportDecision() async {
           final part = File('${manifest.filePath}.swiftshare.part');
           if (await part.exists()) {
             final len = await part.length();
-            resume[i] = _nextChunkForBytes(len, request.files[i].totalChunks);
+            resume[i] = _nextChunkForBytes(ctx, len, request.files[i].totalChunks);
           } else {
             resume[i] = 0;
           }
@@ -887,7 +865,11 @@ Future<void> _logTransportDecision() async {
             '${request.files.length} file(s).',
       );
       unawaited(_foreground.start());
-      emit(state.copyWith(incomingSession: incoming, saveDirectory: saveDir));
+      emit(state.copyWith(
+        incomingSession: incoming,
+        incomingSessions: _incomingSessionList(incoming),
+        saveDirectory: saveDir,
+      ));
     } catch (e) {
       // Destination creation / save-directory resolution failed (permissions,
       // disk error, invalid path). This cannot succeed on retry: abort the
@@ -915,8 +897,7 @@ Future<void> _logTransportDecision() async {
             .toList(),
         createdAt: DateTime.now(),
       );
-      _incoming = null;
-      _incomingSessionId = null;
+      _incomingCtxs.remove(request.sessionId);
       await _sessionRepo.saveSession(failedSession);
       unawaited(_foreground.stop());
       _notifications.showMessage(
@@ -925,14 +906,15 @@ Future<void> _logTransportDecision() async {
       );
       emit(state.copyWith(
         incomingSession: failedSession,
+        incomingSessions: _incomingSessionList(failedSession),
         incomingError: 'Could not prepare incoming files: $e',
       ));
     }
   }
 
   Future<void> _onIncomingChunk(ChunkReceivedEvent event) async {
-    final incoming = _incoming;
-    if (incoming == null) return;
+    final ctx = _incomingCtxs[event.sessionId];
+    if (ctx == null) return;
 
     // Serialize per-file writes: broadcast streams may deliver multiple chunk
     // events while an earlier async handler is still flushing.  Chaining
@@ -940,17 +922,16 @@ Future<void> _logTransportDecision() async {
     // order they arrive, and retried chunks land at their correct offset
     // regardless of when they showed up.
     final chain =
-        _incomingWriteChains[event.fileIndex] ?? Future<void>.value();
+        ctx.writeChains[event.fileIndex] ?? Future<void>.value();
     final next = chain.catchError((_) {}).then(
-          (_) => _processIncomingChunk(event),
+          (_) => _processIncomingChunk(ctx, event),
         );
-    _incomingWriteChains[event.fileIndex] = next.catchError((_) {});
+    ctx.writeChains[event.fileIndex] = next.catchError((_) {});
     return next;
   }
 
-  Future<void> _processIncomingChunk(ChunkReceivedEvent event) async {
-    final incoming = _incoming;
-    if (incoming == null) return;
+  Future<void> _processIncomingChunk(_IncomingCtx ctx, ChunkReceivedEvent event) async {
+    final incoming = ctx.session;
     final fileIndex = event.fileIndex;
     final manifest = incoming.files[fileIndex];
     final partPath = '${manifest.filePath}.swiftshare.part';
@@ -958,15 +939,15 @@ Future<void> _logTransportDecision() async {
     try {
       final actualCrc = Crc32c.hash(event.data);
       if (actualCrc != event.metadata.crc32cChecksum) {
-        await _transport.sendChunkError(fileIndex, event.metadata.index);
+        await _transport.sendChunkError(ctx.sessionId, fileIndex, event.metadata.index);
         return;
       }
 
-      final prefix = _incomingContiguousChunks[fileIndex] ?? 0;
+      final prefix = ctx.contiguousChunks[fileIndex] ?? 0;
 
       if (event.metadata.index < prefix) {
         // A retransmitted chunk whose data is already on disk — ack and move on.
-        await _transport.sendChunkAck(fileIndex, event.metadata.index);
+        await _transport.sendChunkAck(ctx.sessionId, fileIndex, event.metadata.index);
         return;
       }
 
@@ -976,22 +957,22 @@ Future<void> _logTransportDecision() async {
         // chunk arrives, then flush everything in order. Writing strictly in
         // order keeps the part file contiguous, so a late retransmit can never
         // corrupt other chunks' data.
-        (_incomingPendingChunks[fileIndex] ??= <int, Uint8List>{})
+        (ctx.pendingChunks[fileIndex] ??= <int, Uint8List>{})
             [event.metadata.index] = event.data;
-        await _transport.sendChunkAck(fileIndex, event.metadata.index);
+        await _transport.sendChunkAck(ctx.sessionId, fileIndex, event.metadata.index);
         return;
       }
 
       // Sequential chunk: append right after the contiguous prefix.
-      final raf = _incomingRafs[fileIndex] ??=
+      final raf = ctx.rafs[fileIndex] ??=
           await File(partPath).open(mode: FileMode.append);
       await raf.writeFrom(event.data);
 
-      _incomingContiguousChunks[fileIndex] = prefix + 1;
+      ctx.contiguousChunks[fileIndex] = prefix + 1;
 
       // Flush any buffered chunks that are now contiguous, strictly in order.
       var next = prefix + 1;
-      final pending = _incomingPendingChunks[fileIndex];
+      final pending = ctx.pendingChunks[fileIndex];
       if (pending != null) {
         while (pending.containsKey(next)) {
           await raf.writeFrom(pending.remove(next)!);
@@ -1005,21 +986,22 @@ Future<void> _logTransportDecision() async {
       // writes, and resume uses the contiguous-chunk prefix / part length which
       // are still accurate (worst case after a crash the sender resends a few
       // chunks the receiver re-verifies by CRC).
-      var flushDebt = (_incomingFlushDebt[fileIndex] ?? 0) + event.data.length;
+      var flushDebt = (ctx.flushDebt[fileIndex] ?? 0) + event.data.length;
       if (flushDebt >= _kIncomingFlushThresholdBytes ||
           next >= manifest.totalChunks) {
         await raf.flush();
         flushDebt = 0;
       }
-      _incomingFlushDebt[fileIndex] = flushDebt;
-      _incomingContiguousChunks[fileIndex] = next;
+      ctx.flushDebt[fileIndex] = flushDebt;
+      ctx.contiguousChunks[fileIndex] = next;
 
       _pumpIncomingProgress(
+        ctx,
         fileIndex,
         next,
         force: next >= manifest.totalChunks,
       );
-      await _transport.sendChunkAck(fileIndex, event.metadata.index);
+      await _transport.sendChunkAck(ctx.sessionId, fileIndex, event.metadata.index);
     } catch (e) {
       // The CRC check is routed above, so reaching this catch means the chunk
       // could not be WRITTEN (disk full, file removed, permissions). Retrying
@@ -1027,30 +1009,31 @@ Future<void> _logTransportDecision() async {
       // on both ends instead of looping chunk_error → retransmit → error.
       try {
         await _transport.sendSessionFailed(
-          _incomingSessionId ?? '',
+          ctx.sessionId,
           'Could not save incoming data: $e',
         );
       } catch (_) {}
-      await _failIncomingSession('Could not save incoming data: $e');
+      await _failIncomingSession(ctx.sessionId, 'Could not save incoming data: $e');
       return;
     }
   }
 
   Future<void> _onIncomingFileComplete(IncomingFileComplete event) async {
-    final incoming = _incoming;
+    final ctx = _incomingCtxs[event.sessionId];
+    final incoming = ctx?.session;
     if (incoming == null) return;
     try {
       final manifest = incoming.files[event.fileIndex];
       final partPath = '${manifest.filePath}.swiftshare.part';
       final partFile = File(partPath);
 
-      final raf = _incomingRafs.remove(event.fileIndex);
+      final raf = ctx!.rafs.remove(event.fileIndex);
       if (raf != null) {
         try {
           await raf.close();
         } catch (_) {}
       }
-      _incomingFlushDebt.remove(event.fileIndex);
+      ctx.flushDebt.remove(event.fileIndex);
 
       if (!await partFile.exists()) {
         // A duplicate marker (or crash after rename) can leave the part file
@@ -1062,54 +1045,62 @@ Future<void> _logTransportDecision() async {
           if (event.sha256.isNotEmpty) {
             final existingHash = await computeFileHashInBackground(manifest.filePath);
             if (existingHash != event.sha256) {
-              await _incomingFailFile(event.fileIndex);
+              await _incomingFailFile(ctx, event.fileIndex);
               return;
             }
           }
-          await _transport.sendFileCompleteAck(event.fileIndex);
-          final files = List<TransferFileManifest>.from(_incoming!.files);
+          await _transport.sendFileCompleteAck(event.sessionId, event.fileIndex);
+          final files = List<TransferFileManifest>.from(_incomingCtxs[event.sessionId]!.session.files);
           files[event.fileIndex] = files[event.fileIndex].copyWith(
             status: FileTransferStatus.completed,
             chunksSent: files[event.fileIndex].totalChunks,
             lastAckedChunk: files[event.fileIndex].totalChunks - 1,
           );
-          _fileRetryCount.remove(event.fileIndex);
-          _incoming = _incoming!.copyWith(files: files);
-          emit(state.copyWith(incomingSession: _incoming, incomingError: null));
+          _incomingCtxs[event.sessionId]!.session = _incomingCtxs[event.sessionId]!.session.copyWith(files: files);
+          ctx.fileRetryCount.remove(event.fileIndex);
+          emit(state.copyWith(
+            incomingSession: _incomingCtxs[event.sessionId]!.session,
+            incomingSessions: _incomingSessionList(_incomingCtxs[event.sessionId]!.session),
+            incomingError: null,
+          ));
           return;
         }
-        await _incomingFailFile(event.fileIndex);
+        await _incomingFailFile(ctx, event.fileIndex);
         return;
       }
 
       if (await partFile.length() != manifest.fileSize) {
-        await _incomingFailFile(event.fileIndex);
+        await _incomingFailFile(ctx, event.fileIndex);
         return;
       }
 
       final actualHash = await computeFileHashInBackground(partPath);
       if (event.sha256.isNotEmpty && actualHash != event.sha256) {
-        await _incomingFailFile(event.fileIndex);
+        await _incomingFailFile(ctx, event.fileIndex);
         return;
       }
 
       final finalFile = File(manifest.filePath);
       if (await finalFile.exists()) await finalFile.delete();
       await partFile.rename(manifest.filePath);
-      await _transport.sendFileCompleteAck(event.fileIndex);
+      await _transport.sendFileCompleteAck(event.sessionId, event.fileIndex);
 
-      final files = List<TransferFileManifest>.from(_incoming!.files);
+      final files = List<TransferFileManifest>.from(_incomingCtxs[event.sessionId]!.session.files);
       files[event.fileIndex] = files[event.fileIndex].copyWith(
         status: FileTransferStatus.completed,
         chunksSent: files[event.fileIndex].totalChunks,
         lastAckedChunk: files[event.fileIndex].totalChunks - 1,
         actualHash: actualHash,
       );
-      _fileRetryCount.remove(event.fileIndex);
-      _incoming = _incoming!.copyWith(files: files);
-      _incomingContiguousChunks.remove(event.fileIndex);
-      _incomingPendingChunks.remove(event.fileIndex);
-      emit(state.copyWith(incomingSession: _incoming, incomingError: null));
+      ctx.fileRetryCount.remove(event.fileIndex);
+      _incomingCtxs[event.sessionId]!.session = _incomingCtxs[event.sessionId]!.session.copyWith(files: files);
+      ctx.contiguousChunks.remove(event.fileIndex);
+      ctx.pendingChunks.remove(event.fileIndex);
+      emit(state.copyWith(
+        incomingSession: _incomingCtxs[event.sessionId]!.session,
+        incomingSessions: _incomingSessionList(_incomingCtxs[event.sessionId]!.session),
+        incomingError: null,
+      ));
     } catch (e) {
       // Verification/I/O error while finalizing the file (rename, hash read,
       // delete). A resend cannot heal a disk-level failure, so abort the whole
@@ -1120,28 +1111,23 @@ Future<void> _logTransportDecision() async {
           'Incoming file verification failed: $e',
         );
       } catch (_) {}
-      await _failIncomingSession('Incoming file verification failed: $e');
+      await _failIncomingSession(event.sessionId, 'Incoming file verification failed: $e');
     }
   }
 
-  /// Marks the active incoming session as failed on this device, cleans up all
+  /// Marks the named incoming session as failed on this device, cleans up all
   /// receive bookkeeping, and surfaces a visible "Failed" state so the receiver
   /// converges with the sender instead of sitting on "Waiting" forever.
-  Future<void> _failIncomingSession(String reason) async {
-    final incoming = _incoming;
+  Future<void> _failIncomingSession(String sessionId, String reason) async {
+    final ctx = _incomingCtxs[sessionId];
+    final incoming = ctx?.session;
     if (incoming == null || incoming.status == SessionStatus.completed) return;
-    for (final raf in _incomingRafs.values) {
+    for (final raf in ctx!.rafs.values) {
       try {
         await raf.close();
       } catch (_) {}
     }
-    _incomingRafs.clear();
-    _incomingWriteChains.clear();
-    _incomingPendingChunks.clear();
-    _incomingContiguousChunks.clear();
-    _incomingFlushDebt.clear();
-    _incomingSessionId = null;
-    _fileRetryCount.clear();
+    _incomingCtxs.remove(sessionId);
 
     final failedFiles = incoming.files
         .map((f) => f.status == FileTransferStatus.completed
@@ -1153,76 +1139,74 @@ Future<void> _logTransportDecision() async {
       files: failedFiles,
     );
     await _sessionRepo.saveSession(failed);
-    unawaited(_foreground.stop());
+    if (_incomingCtxs.isEmpty) unawaited(_foreground.stop());
     _notifications.showMessage(
       title: 'Transfer failed',
       body: reason,
     );
     emit(state.copyWith(
-      incomingSession: failed,
+      incomingSession: _incomingCtxs.isEmpty ? failed : _incoming,
+      incomingSessions: _incomingSessionList(failed),
       incomingError: reason,
     ));
-    _incoming = null;
   }
 
-  Future<void> _incomingFailFile(int fileIndex) async {
-    if (_incoming == null) return;
+  Future<void> _incomingFailFile(_IncomingCtx ctx, int fileIndex) async {
+    final incoming = ctx.session;
     // Delete the corrupt partial file so the resend starts from scratch.
-    final manifest = _incoming!.files[fileIndex];
+    final manifest = incoming.files[fileIndex];
     final partFile = File('${manifest.filePath}.swiftshare.part');
     try {
       if (await partFile.exists()) await partFile.delete();
     } catch (_) {}
-    final raf = _incomingRafs.remove(fileIndex);
+    final raf = ctx.rafs.remove(fileIndex);
     if (raf != null) {
       try {
         await raf.close();
       } catch (_) {}
     }
-    _incomingPendingChunks.remove(fileIndex);
-    _incomingContiguousChunks.remove(fileIndex);
-    _incomingFlushDebt.remove(fileIndex);
+    ctx.pendingChunks.remove(fileIndex);
+    ctx.contiguousChunks.remove(fileIndex);
+    ctx.flushDebt.remove(fileIndex);
 
-    final files = List<TransferFileManifest>.from(_incoming!.files);
+    final files = List<TransferFileManifest>.from(incoming.files);
     files[fileIndex] = files[fileIndex].copyWith(
       status: FileTransferStatus.failed,
     );
-    _incoming = _incoming!.copyWith(files: files);
+    ctx.session = incoming.copyWith(files: files);
     emit(state.copyWith(
-      incomingSession: _incoming,
+      incomingSession: ctx.session,
+      incomingSessions: _incomingSessionList(ctx.session),
       incomingError: 'File verification failed; requesting resend…',
     ));
 
     // A whole-file resend that keeps failing is not going to fix itself:
     // escalate to a session failure so both ends stop retrying forever.
-    final retries = (_fileRetryCount[fileIndex] ?? 0) + 1;
-    _fileRetryCount[fileIndex] = retries;
+    final retries = (ctx.fileRetryCount[fileIndex] ?? 0) + 1;
+    ctx.fileRetryCount[fileIndex] = retries;
     if (retries >= 3) {
       try {
         await _transport.sendSessionFailed(
-          _incomingSessionId ?? '',
+          ctx.sessionId,
           'File failed verification after repeated resends.',
         );
       } catch (_) {}
-      await _failIncomingSession('File failed verification after repeated resends.');
+      await _failIncomingSession(ctx.sessionId, 'File failed verification after repeated resends.');
       return;
     }
-    await _transport.sendFileRetry(fileIndex);
+    await _transport.sendFileRetry(ctx.sessionId, fileIndex);
   }
 
-  Future<void> _onIncomingSessionComplete() async {
-    final incoming = _incoming;
+  Future<void> _onIncomingSessionComplete(String sessionId) async {
+    final ctx = _incomingCtxs[sessionId];
+    final incoming = ctx?.session;
     if (incoming == null) return;
-    for (final raf in _incomingRafs.values) {
+    for (final raf in ctx!.rafs.values) {
       try {
         await raf.close();
       } catch (_) {}
     }
-    _incomingRafs.clear();
-    _incomingWriteChains.clear();
-    _incomingPendingChunks.clear();
-    _incomingContiguousChunks.clear();
-    _incomingSessionId = null;
+    _incomingCtxs.remove(sessionId);
 
     final completed = incoming.copyWith(
       status: SessionStatus.completed,
@@ -1231,34 +1215,51 @@ Future<void> _logTransportDecision() async {
     await _sessionRepo.saveSession(completed);
     _notifications.showMessage(
       title: 'Transfer complete',
-      body: '${completed.files.length} file(s) saved to ${_incomingSaveDir ?? ''}',
+      body: '${completed.files.length} file(s) saved to ${ctx.saveDir}',
     );
-    unawaited(_foreground.stop());
-    emit(state.copyWith(incomingSession: completed));
-    _incoming = null;
+    if (_incomingCtxs.isEmpty) unawaited(_foreground.stop());
+    emit(state.copyWith(
+      incomingSession: _incomingCtxs.isEmpty ? completed : _incoming,
+      incomingSessions: _incomingSessionList(completed),
+    ));
   }
 
-  void _pumpIncomingProgress(int fileIndex, int chunksReceived, {bool force = false}) {
-  if (_incoming == null) return;
+  void _pumpIncomingProgress(_IncomingCtx ctx, int fileIndex, int chunksReceived,
+      {bool force = false}) {
+  final incoming = ctx.session;
   final now = DateTime.now();
-  if (!force && now.difference(_lastIncomingUiEmit) < _kUiProgressInterval) {
+  if (!force && now.difference(ctx.lastUiEmit) < _kUiProgressInterval) {
     return;
   }
-  if (!force) _lastIncomingUiEmit = now;
+  if (!force) ctx.lastUiEmit = now;
 
-  final files = List<TransferFileManifest>.from(_incoming!.files);
+  final files = List<TransferFileManifest>.from(incoming.files);
   files[fileIndex] = files[fileIndex].copyWith(
     status: FileTransferStatus.transferring,
     chunksSent: chunksReceived,
     lastAckedChunk: chunksReceived - 1,
   );
-  _incoming = _incoming!.copyWith(files: files);
-  emit(state.copyWith(incomingSession: _incoming));
+  ctx.session = incoming.copyWith(files: files);
+  emit(state.copyWith(
+    incomingSession: ctx.session,
+    incomingSessions: _incomingSessionList(ctx.session),
+  ));
 }
 
-  int _nextChunkForBytes(int bytes, int totalChunks) {
+  /// Builds the full list of active incoming sessions for the state, keeping
+  /// the [updated] session fresh in place.
+  List<TransferSession> _incomingSessionList(TransferSession updated) {
+    final sessions = List<TransferSession>.from(_incomingCtxs.values.map((c) => c.session));
+    for (var i = 0; i < sessions.length; i++) {
+      if (sessions[i].id == updated.id) sessions[i] = updated;
+    }
+    if (!sessions.any((s) => s.id == updated.id)) sessions.add(updated);
+    return sessions;
+  }
+
+  int _nextChunkForBytes(_IncomingCtx ctx, int bytes, int totalChunks) {
     if (bytes <= 0) return 0;
-    final chunkSize = _incomingChunkSize;
+    final chunkSize = ctx.chunkSize;
     final n = (bytes / chunkSize).ceil();
     return n >= totalChunks ? totalChunks : n;
   }
@@ -1291,4 +1292,44 @@ Future<void> _logTransportDecision() async {
     _foreground.dispose();
     return super.close();
   }
+}
+
+/// Per-session receiver bookkeeping. One instance per concurrently connected
+/// sender, so parallel inbound transfers never share a RandomAccessFile or a
+/// contiguous-prefix counter.
+class _IncomingCtx {
+  _IncomingCtx({
+    required this.session,
+    required this.saveDir,
+    required this.chunkSize,
+  });
+
+  TransferSession session;
+  String get sessionId => session.id;
+
+  final String saveDir;
+  final int chunkSize;
+
+  /// Serializes disk writes per file so concurrent inbound chunks can never
+  /// interleave offsets on the same RandomAccessFile.
+  final Map<int, RandomAccessFile> rafs = {};
+
+  final Map<int, Future<void>> writeChains = {};
+
+  /// Number of contiguous chunks ([0, n)) already flushed to disk per file.
+  /// Never recedes, so progress and resume points stay accurate even with
+  /// out-of-order retransmits.
+  final Map<int, int> contiguousChunks = {};
+
+  /// Chunks accepted from the wire but not yet writable because a lower index
+  /// is still being retransmitted. Bounded by the sender's in-flight window.
+  final Map<int, Map<int, Uint8List>> pendingChunks = {};
+
+  /// Bytes written to each part file since the last forced flush().
+  final Map<int, int> flushDebt = {};
+
+  /// Consecutive whole-file resend (file_retry) requests sent per file index.
+  final Map<int, int> fileRetryCount = {};
+
+  DateTime lastUiEmit = DateTime.fromMillisecondsSinceEpoch(0);
 }

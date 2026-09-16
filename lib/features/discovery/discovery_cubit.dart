@@ -10,6 +10,7 @@ class DiscoveryCubit extends Cubit<DiscoveryState> {
   StreamSubscription? _stateSub;
   StreamSubscription? _peerConnectedSub;
   StreamSubscription? _peerDisconnectedSub;
+  StreamSubscription? _peerListSub;
   bool _receiverMode = false;
 
   DiscoveryCubit(this._transport) : super(const DiscoveryState()) {
@@ -72,11 +73,27 @@ class DiscoveryCubit extends Cubit<DiscoveryState> {
     });
 
     _peerDisconnectedSub = _transport.onPeerDisconnected.listen((name) {
+      if (state.connectedPeers.isEmpty) {
+        emit(state.copyWith(
+          connectedPeer: null,
+          status: _receiverMode
+              ? DiscoveryStatus.listening
+              : DiscoveryStatus.searching,
+          clearError: true,
+        ));
+      }
+    });
+
+    // Multi-device: the transport owns the authoritative peer list. Each
+    // snapshot keeps the singular `connectedPeer` (first link, for backwards
+    // compatibility) in sync with the full list.
+    _peerListSub = _transport.onPeerList.listen((peers) {
       emit(state.copyWith(
-        connectedPeer: null,
-        status: _receiverMode
-            ? DiscoveryStatus.listening
-            : DiscoveryStatus.searching,
+        connectedPeers: peers,
+        status: peers.isNotEmpty ? DiscoveryStatus.connected : state.status,
+        connectedPeer: peers.isNotEmpty
+            ? peers.first.deviceName
+            : null,
         clearError: true,
       ));
     });
@@ -180,6 +197,7 @@ class DiscoveryCubit extends Cubit<DiscoveryState> {
     _stateSub?.cancel();
     _peerConnectedSub?.cancel();
     _peerDisconnectedSub?.cancel();
+    _peerListSub?.cancel();
     return super.close();
   }
 }

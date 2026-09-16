@@ -65,6 +65,43 @@ class SessionFileMeta {
   );
 }
 
+/// One real-time chat message exchanged with a connected peer over the data
+/// channel. Chat is transport-level: it shares the established peer link, so
+/// it works offline and needs no extra network setup.
+class ChatMessage {
+  final String id;
+  final String text;
+  final String senderId;
+  final String senderName;
+  final DateTime timestamp;
+
+  const ChatMessage({
+    required this.id,
+    required this.text,
+    required this.senderId,
+    required this.senderName,
+    required this.timestamp,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'type': 'chat_msg',
+        'id': id,
+        'text': text,
+        'senderId': senderId,
+        'senderName': senderName,
+        'timestamp': timestamp.toUtc().toIso8601String(),
+      };
+
+  factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
+        id: json['id'] as String? ?? '',
+        text: json['text'] as String? ?? '',
+        senderId: json['senderId'] as String? ?? '',
+        senderName: json['senderName'] as String? ?? 'Unknown',
+        timestamp: DateTime.tryParse(json['timestamp'] as String? ?? '')?.toLocal() ??
+            DateTime.now(),
+      );
+}
+
 /// A remote device wants to send us files.
 class IncomingSession {
   final String sessionId;
@@ -125,8 +162,8 @@ abstract class TransportChannel {
   final StreamController<IncomingFileComplete> incomingFileCompleteController =
       StreamController<IncomingFileComplete>.broadcast();
   @protected
-  final StreamController<void> incomingSessionCompleteController =
-      StreamController<void>.broadcast();
+  final StreamController<String> incomingSessionCompleteController =
+      StreamController<String>.broadcast();
   @protected
   final StreamController<PeerConnection> peerConnectedController =
       StreamController<PeerConnection>.broadcast();
@@ -136,6 +173,12 @@ abstract class TransportChannel {
   @protected
   final StreamController<SessionFailed> sessionFailedController =
       StreamController<SessionFailed>.broadcast();
+  @protected
+  final StreamController<ChatMessage> chatReceivedController =
+      StreamController<ChatMessage>.broadcast();
+  @protected
+  final StreamController<List<PeerConnection>> peerListController =
+      StreamController<List<PeerConnection>>.broadcast();
 
   Stream<DeviceInfo> get onDeviceFound => deviceFoundController.stream;
   Stream<TransportState> get onStateChanged => stateController.stream;
@@ -144,7 +187,9 @@ abstract class TransportChannel {
   Stream<IncomingSession> get onIncomingSession => incomingSessionController.stream;
   Stream<IncomingFileComplete> get onIncomingFileComplete =>
       incomingFileCompleteController.stream;
-  Stream<void> get onIncomingSessionComplete =>
+  /// Emits the id of a session whose transfer finished successfully on this end
+  /// (all files verified and acked).
+  Stream<String> get onIncomingSessionComplete =>
       incomingSessionCompleteController.stream;
 
   /// A live peer link was established (either this device initiated it or the
@@ -159,6 +204,13 @@ abstract class TransportChannel {
   /// the file it was sending from). Emits the session id + reason.
   Stream<SessionFailed> get onSessionFailed => sessionFailedController.stream;
 
+  /// A text [ChatMessage] arrived from a connected peer.
+  Stream<ChatMessage> get onChatReceived => chatReceivedController.stream;
+
+  /// Snapshot + incremental updates of the live peer links. Each entry is one
+  /// concurrently connected device (the base of multi-device support).
+  Stream<List<PeerConnection>> get onPeerList => peerListController.stream;
+
   TransportState _state = TransportState.disconnected;
   TransportState get state => _state;
 
@@ -171,6 +223,12 @@ abstract class TransportChannel {
   /// Configures the device name announced during discovery.
   void setDeviceName(String name) {}
 
+  /// Stable identity of THIS device, stamped on outgoing chat messages.
+  String get deviceId => '';
+
+  /// The device name configured via [setDeviceName].
+  String get deviceName => '';
+
   /// The transport class this implementation uses to put the peers on a shared
   /// network segment. Transfer semantics (chunking, retry, resume, CRC,
   /// scheduling) are identical across every kind; only the link is different.
@@ -182,13 +240,25 @@ abstract class TransportChannel {
   Future<void> stopDiscovery();
   Future<void> connectToDevice(DeviceInfo device);
 
+  /// The peers with an active, handshaked link right now.
+  List<PeerConnection> get connectedPeers => const [];
+
+  /// Send a text message to one connected peer (by device name).
+  Future<void> sendChat(String peerId, String text);
+
+  /// Broadcast a text message to every connected peer.
+  Future<void> sendChatBroadcast(String text);
+
   /// Declare an outgoing transfer session. Resolves once the receiver
-  /// acknowledges with its resume points.
+  /// acknowledges with its resume points. When [peerId] is given the session
+  /// is sent to that specific peer (multi-device); otherwise it goes to the
+  /// primary link.
   Future<ResumePoints> sendSessionStart(
     String sessionId,
     String deviceName,
     List<SessionFileMeta> files, {
     int? chunkSize,
+    String? peerId,
   });
 
   /// Send one chunk; completes when the receiver acknowledges it.
@@ -231,16 +301,16 @@ abstract class TransportChannel {
   Future<void> acceptIncoming(String sessionId, ResumePoints resumePoints);
 
   /// Confirm a received chunk (CRC ok) so the sender continues.
-  Future<void> sendChunkAck(int fileIndex, int chunkIndex);
+  Future<void> sendChunkAck(String sessionId, int fileIndex, int chunkIndex);
 
   /// Report a bad chunk so the sender retransmits it.
-  Future<void> sendChunkError(int fileIndex, int chunkIndex);
+  Future<void> sendChunkError(String sessionId, int fileIndex, int chunkIndex);
 
   /// Confirm the whole file verified (SHA-256) so the sender moves on.
-  Future<void> sendFileCompleteAck(int fileIndex);
+  Future<void> sendFileCompleteAck(String sessionId, int fileIndex);
 
   /// Request the sender retransmit every chunk of a corrupt file.
-  Future<void> sendFileRetry(int fileIndex);
+  Future<void> sendFileRetry(String sessionId, int fileIndex);
 
   void pause();
   void resume();
@@ -256,13 +326,16 @@ abstract class TransportChannel {
     peerConnectedController.close();
     peerDisconnectedController.close();
     sessionFailedController.close();
+    chatReceivedController.close();
+    peerListController.close();
   }
 }
 
 /// A live, handshaked peer link.
 class PeerConnection {
   final String deviceName;
-  const PeerConnection({required this.deviceName});
+  final String deviceId;
+  const PeerConnection({required this.deviceName, required this.deviceId});
 }
 
 /// The remote peer reported that an active session could not continue.
@@ -273,11 +346,13 @@ class SessionFailed {
 }
 
 class ChunkReceivedEvent {
+  final String sessionId;
   final int fileIndex;
   final ChunkMetadata metadata;
   final Uint8List data;
 
   const ChunkReceivedEvent({
+    required this.sessionId,
     required this.fileIndex,
     required this.metadata,
     required this.data,
