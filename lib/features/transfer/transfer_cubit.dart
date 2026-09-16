@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show debugPrint, kIsWeb;
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
@@ -11,16 +11,34 @@ import 'transfer_state.dart';
 import 'session/transfer_session.dart';
 import 'session/session_repository.dart';
 import '../../transport/transport_channel.dart';
-import '../../core/services/notification_service.dart';
+import '../../transport/device_info.dart';
+import '../../transport/transport_kind.dart';
+import '../../transport/transfer_manager.dart';
+import '../../core/services/transfer_notification_queue.dart';
+import '../../core/services/network_diagnostics.dart';
+import '../../core/services/transfer_foreground_service.dart';
 import '../../core/utils/chunker.dart';
 import '../../core/utils/crc32c.dart';
 import '../../core/utils/file_categorizer.dart';
 import '../file_picker/file_picker_state.dart';
 
+/// Upper bound on how often the TransferCubit may emit UI progress updates.
+/// The transfer engine keeps exact byte counters internally; the UI only needs
+/// ~15 updates/sec for smooth rendering (way down from one emit per chunk).
+const Duration _kUiProgressInterval = Duration(milliseconds: 66);
+
+/// Receiver-side fsync cadence. Flushing RandomAccessFile every chunk forces a
+/// disk write-through per chunk; the OS page cache already orders the writes,
+/// so we only call flush() once ~8 MB of chunks accumulated or the file ends.
+/// ACKs are sent after the write (not the flush), so pipelining is untouched.
+const int _kIncomingFlushThresholdBytes = 8 * 1024 * 1024;
+
 class TransferCubit extends Cubit<TransferState> {
   final TransportChannel _transport;
   final SessionRepository _sessionRepo;
-  final NotificationService _notifications;
+  final TransferNotificationQueue _notifications;
+  final NetworkDiagnostics _diagnostics;
+  final TransferForegroundService _foreground;
   final Box _settingsBox;
 
   StreamSubscription? _stateSub;
@@ -36,11 +54,23 @@ class TransferCubit extends Cubit<TransferState> {
   bool _isPaused = false;
   int _lastProgressBytes = 0;
   DateTime _lastSpeedSample = DateTime.now();
+  DateTime _lastUiEmit = DateTime.fromMillisecondsSinceEpoch(0);
   Map<int, int> _resumePoints = {};
 
   // Number of full chunks already acknowledged by the receiver for the file
   // currently being sent. Drives pause markers and progress.
   int _highestAckedChunk = 0;
+
+  /// Adaptive transfer-lane budget. Starts at the configured
+  /// `maxConcurrentFiles` base and drifts ± with the measured chunk round-trip
+  /// latency between files (bounded so memory stays predictable).
+  int _depthBias = 0;
+
+  /// Round-trip samples for the current file (microseconds per chunk send).
+  final List<int> _chunkRttSamples = [];
+
+  /// Most recent average chunk round-trip latency, for the diagnostics log.
+  int _lastAckLatencyMicros = 0;
 
   // Receiver state.
   TransferSession? _incoming;
@@ -48,6 +78,7 @@ class TransferCubit extends Cubit<TransferState> {
   int _incomingChunkSize = 512 * 1024;
   final Map<int, RandomAccessFile> _incomingRafs = {};
   String? _incomingSessionId;
+  DateTime _lastIncomingUiEmit = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// Serializes disk writes per file so concurrent inbound chunks can never
   /// interleave offsets on the same RandomAccessFile.
@@ -62,6 +93,9 @@ class TransferCubit extends Cubit<TransferState> {
   /// is still being retransmitted. Bounded by the sender's in-flight window.
   final Map<int, Map<int, Uint8List>> _incomingPendingChunks = {};
 
+  /// Bytes written to each part file since the last forced flush().
+  final Map<int, int> _incomingFlushDebt = {};
+
   /// Files a whole-file resend is in progress for; such files always restart
   /// at chunk 0 regardless of previously acked progress.
   final Set<int> _forcedRestartFiles = {};
@@ -70,6 +104,8 @@ class TransferCubit extends Cubit<TransferState> {
     this._transport,
     this._sessionRepo,
     this._notifications,
+    this._diagnostics,
+    this._foreground,
     this._settingsBox,
   ) : super(const TransferState()) {
     _stateSub = _transport.onStateChanged.listen(_onTransportStateChanged);
@@ -89,11 +125,15 @@ class TransferCubit extends Cubit<TransferState> {
   }
 
   /// How many chunks may be in flight before the sender waits for an ack.
-  /// Reuses the persisted "max concurrent files" knob as the parallel-window
-  /// depth. Bounded (max 16) so large transfers never buffer the whole file.
-  int get _pipelineDepth =>
-      (_settingsBox.get('maxConcurrentFiles', defaultValue: 3) as int)
-          .clamp(1, 16);
+  /// Starts from the persisted "max concurrent files" knob and is adjusted
+  /// between files by measured round-trip latency. Bounded (max 16) so large
+  /// transfers never buffer the whole file.
+  int get _pipelineDepth {
+    final base =
+        (_settingsBox.get('maxConcurrentFiles', defaultValue: 3) as int)
+            .clamp(1, 8);
+    return (base + _depthBias).clamp(1, 16);
+  }
 
   String get _deviceName =>
       _settingsBox.get('deviceName', defaultValue: 'My Device');
@@ -119,8 +159,9 @@ class TransferCubit extends Cubit<TransferState> {
         files: files,
       );
       _isPaused = true;
+      unawaited(_foreground.stop());
       _sessionRepo.saveSession(paused);
-      _notifications.showTransferMessage(
+      _notifications.showMessage(
         title: 'Connection lost',
         body: 'Tap Resume to reconnect and continue where it stopped.',
       );
@@ -189,14 +230,20 @@ class TransferCubit extends Cubit<TransferState> {
     _highestAckedChunk = 0;
     _lastProgressBytes = 0;
     _lastSpeedSample = DateTime.now();
+    _lastUiEmit = DateTime.fromMillisecondsSinceEpoch(0);
     _isPaused = false;
     _forcedRestartFiles.clear();
 
-    _notifications.showTransferProgress(
+    _notifications.showProgress(
       title: 'SwiftShare',
       body: 'Sending ${files.length} file(s)…',
       progress: 0,
     );
+
+    unawaited(_captureNetworkInfo());
+    unawaited(_logTransportDecision());
+
+    unawaited(_foreground.start());
 
     emit(state.copyWith(
       status: TransferStatus.transferring,
@@ -206,11 +253,51 @@ class TransferCubit extends Cubit<TransferState> {
     _startChunkedTransfer();
   }
 
+  /// Logs which transport class the engine is actually running on, plus the
+/// recommendation the [TransportManager] would make given the measured link.
+/// Diagnostic only — never blocks the transfer, never changes behaviour.
+Future<void> _logTransportDecision() async {
+  final decision = const TransportManager().evaluate(
+    link: state.networkInfo,
+    localDiscoveryDetected: true,
+    platform: _transport.transportKind == TransportKind.wifiDirect
+        ? DevicePlatform.android
+        : DevicePlatform.unknown,
+  );
+  debugPrint(
+    '[TRANSPORT] actual=${_transport.transportKind.label} '
+    'recommended=${decision.kind.label} (${decision.confidence}%) — '
+    '${decision.rationale.join(' | ')}',
+  );
+  if (!isClosed) {
+    emit(state.copyWith(
+      transportLabel: '${_transport.transportKind.label} • '
+          '${decision.kind.label} (${decision.confidence}%)',
+    ));
+  }
+}
+
+/// Reads the active radio's negotiated parameters (band, Wi-Fi standard,
+  /// link speed) and reflects them into the UI + logs. Best-effort and never
+  /// allowed to block or fail the transfer.
+  Future<void> _captureNetworkInfo() async {
+    try {
+      final info = await _diagnostics.getActiveWifiInfo();
+      if (info != null) {
+        debugPrint(
+          '[TRANSFER] network=${info.summaryLabel} '
+          'ssid=${info.ssid ?? "?"} rssi=${info.rssiDbm ?? 0}dBm',
+        );
+        if (!isClosed) emit(state.copyWith(networkInfo: info));
+      }
+    } catch (_) {}
+  }
+
   void _startChunkedTransfer() async {
     if (state.session == null) return;
     _isPaused = false;
+    unawaited(_foreground.start());
     final chunkSize = _chunkSize;
-    final depth = _pipelineDepth;
 
     while (_currentFileIndex < state.session!.files.length) {
       if (_isPaused) return;
@@ -261,6 +348,7 @@ class TransferCubit extends Cubit<TransferState> {
         // Sliding window of chunk sends: fire up to [depth] chunks before
         // waiting on an ack. Memory stays bounded (a few chunks) regardless of
         // file size; the reader's read-ahead feeds the window while awaiting.
+        final depth = _pipelineDepth;
         final inFlight = <Future<void>>[];
         var sent = 0;
         var acked = current;
@@ -274,9 +362,13 @@ class TransferCubit extends Cubit<TransferState> {
           }
 
           final chunk = await reader.readChunk(current);
+          final sw = Stopwatch()..start();
           inFlight.add(
             _sendChunkWithRetry(_currentFileIndex, chunk).then<void>(
-              (_) {},
+              (_) {
+                sw.stop();
+                _chunkRttSamples.add(sw.elapsedMicroseconds);
+              },
               onError: (Object e, StackTrace st) => sendError ??= e,
             ),
           );
@@ -292,12 +384,12 @@ class TransferCubit extends Cubit<TransferState> {
           acked++;
         }
         _highestAckedChunk = acked;
-        _updateProgress(chunksSent: sent, ackedChunks: acked);
+        _updateProgress(chunksSent: sent, ackedChunks: acked, force: true);
 
         if (sendError != null) {
           failure = sendError;
         } else if (!_isPaused) {
-          hash = await computeFileHash(sourcePath);
+          hash = await computeFileHashInBackground(sourcePath);
           try {
             await _transport.sendFileComplete(
               _currentFileIndex,
@@ -334,6 +426,8 @@ class TransferCubit extends Cubit<TransferState> {
 
       _updateFileStatus(_currentFileIndex, FileTransferStatus.completed,
           actualHash: hash);
+      _adjustLaneBudget();
+      _chunkRttSamples.clear();
       _forcedRestartFiles.remove(_currentFileIndex);
       _currentFileIndex++;
       _resumePoints.clear();
@@ -345,10 +439,11 @@ class TransferCubit extends Cubit<TransferState> {
     );
     await _sessionRepo.saveSession(completedSession);
     await _transport.sendSessionComplete(completedSession.id);
-    _notifications.showTransferMessage(
+    _notifications.showMessage(
       title: 'Transfer complete',
       body: 'All ${completedSession.files.length} file(s) sent.',
     );
+    unawaited(_foreground.stop());
     emit(state.copyWith(
       status: TransferStatus.completed,
       session: completedSession,
@@ -393,9 +488,31 @@ class TransferCubit extends Cubit<TransferState> {
     }
   }
 
+  /// Grows/shrinks the in-flight lane budget based on measured chunk round-trip
+  /// latency. Running on the measured link, so it makes no claims about Wi-Fi
+  /// branding. Bounded drift keeps memory use predictable.
+  void _adjustLaneBudget() {
+    if (_chunkRttSamples.length < 2) return;
+    var sum = 0;
+    for (final sample in _chunkRttSamples) {
+      sum += sample;
+    }
+    final avgMicros = sum ~/ _chunkRttSamples.length;
+    _lastAckLatencyMicros = avgMicros;
+    if (avgMicros < 8000) {
+      _depthBias = (_depthBias + 1).clamp(-2, 8);
+    } else if (avgMicros > 50000) {
+      _depthBias = (_depthBias - 1).clamp(-2, 8);
+    }
+    debugPrint(
+      '[TRANSFER] lanes=$_pipelineDepth avgChunkRtt=${_lastAckLatencyMicros}us',
+    );
+  }
+
   void _failTransfer(Object e, TransferFileManifest manifest) {
     _updateFileStatus(_currentFileIndex, FileTransferStatus.failed);
-    _notifications.showTransferMessage(
+    unawaited(_foreground.stop());
+    _notifications.showMessage(
       title: 'Transfer failed',
       body: manifest.fileName,
     );
@@ -422,48 +539,58 @@ class TransferCubit extends Cubit<TransferState> {
     emit(state.copyWith(session: session));
   }
 
-  void _updateProgress({required int chunksSent, required int ackedChunks}) {
-    if (state.session == null) return;
-    final session = state.session!;
+  void _updateProgress({
+  required int chunksSent,
+  required int ackedChunks,
+  bool force = false,
+}) {
+  if (state.session == null) return;
+  final session = state.session!;
+  if (_currentFileIndex >= session.files.length) return;
 
-    final files = List<TransferFileManifest>.from(session.files);
-    if (_currentFileIndex < files.length) {
-      files[_currentFileIndex] = files[_currentFileIndex].copyWith(
-        chunksSent: chunksSent,
-        lastAckedChunk: ackedChunks - 1,
-        status: FileTransferStatus.transferring,
-      );
-    }
+  final files = List<TransferFileManifest>.from(session.files);
+  files[_currentFileIndex] = files[_currentFileIndex].copyWith(
+    chunksSent: chunksSent,
+    lastAckedChunk: ackedChunks - 1,
+    status: FileTransferStatus.transferring,
+  );
 
-    final updatedSession = session.copyWith(files: files);
-    final totalBytes = updatedSession.totalBytes;
-    final transferredBytes = updatedSession.transferredBytes;
+  final updatedSession = session.copyWith(files: files);
+  final totalBytes = updatedSession.totalBytes;
+  final transferredBytes = updatedSession.transferredBytes;
+  final progress = totalBytes > 0 ? transferredBytes / totalBytes : 0.0;
 
-    final now = DateTime.now();
-    final elapsed = now.difference(_lastSpeedSample).inMilliseconds;
-    double speed = state.speed;
-    if (elapsed >= 800) {
-      final delta = transferredBytes - _lastProgressBytes;
-      speed = delta * 1000 / elapsed;
-      _lastProgressBytes = transferredBytes;
-      _lastSpeedSample = now;
-    }
+  final now = DateTime.now();
+  final elapsed = now.difference(_lastSpeedSample).inMilliseconds;
+  double speed = state.speed;
+  if (elapsed >= 800) {
+    final delta = transferredBytes - _lastProgressBytes;
+    speed = delta * 1000 / elapsed;
+    _lastProgressBytes = transferredBytes;
+    _lastSpeedSample = now;
+  }
 
+  // Throttle UI emissions to ~15/sec (the transfer engine keeps its own exact
+  // byte counters above). `force` guarantees the final state is emitted.
+  final shouldEmit = force ||
+      now.difference(_lastUiEmit) >= _kUiProgressInterval;
+  if (shouldEmit) {
+    _lastUiEmit = now;
     emit(state.copyWith(
       session: updatedSession,
-      overallProgress: totalBytes > 0 ? transferredBytes / totalBytes : 0,
+      overallProgress: progress,
       speed: speed,
     ));
-
-    _notifications.showTransferProgress(
-      title: 'SwiftShare',
-      body:
-          '${(totalBytes > 0 ? transferredBytes / totalBytes : 0) * 100 ~/ 1}%'
-          ' • ${files[_currentFileIndex].fileName}'
-          ' ($_currentChunkIndex/${files[_currentFileIndex].totalChunks})',
-      progress: totalBytes > 0 ? transferredBytes / totalBytes : 0,
-    );
   }
+
+  _notifications.showProgress(
+    title: 'SwiftShare',
+    body: '${(progress * 100).toInt()}%'
+        ' • ${files[_currentFileIndex].fileName}'
+        ' ($_currentChunkIndex/${files[_currentFileIndex].totalChunks})',
+    progress: progress,
+  );
+}
 
   void pauseTransfer() {
     if (state.session == null) return;
@@ -483,7 +610,7 @@ class TransferCubit extends Cubit<TransferState> {
       files: files,
     );
     _sessionRepo.saveSession(session);
-    _notifications.showTransferMessage(
+    _notifications.showMessage(
       title: 'Transfer paused',
       body: 'Resume anytime to continue where it stopped.',
     );
@@ -633,6 +760,7 @@ class TransferCubit extends Cubit<TransferState> {
       _incomingWriteChains.clear();
       _incomingPendingChunks.clear();
       _incomingContiguousChunks.clear();
+      _incomingFlushDebt.clear();
     }
 
     // Resume from the contiguous on-disk prefix when available (accurate
@@ -662,10 +790,11 @@ class TransferCubit extends Cubit<TransferState> {
     await _sessionRepo.saveSession(incoming);
     await _transport.acceptIncoming(request.sessionId, resume);
 
-    _notifications.showTransferMessage(
+    _notifications.showMessage(
       title: 'Incoming transfer',
       body: '${request.remoteDeviceName} is sending ${request.files.length} file(s).',
     );
+    unawaited(_foreground.start());
     emit(state.copyWith(incomingSession: incoming, saveDirectory: saveDir));
   }
 
@@ -737,10 +866,27 @@ class TransferCubit extends Cubit<TransferState> {
           next++;
         }
       }
-      await raf.flush();
+
+      // Coalesce fsync: flush once ~8 MB accumulated (or at file end) instead
+      // of once per chunk. The chunk ack goes out after the write completes,
+      // which keeps the sender's pipeline full; the OS page cache orders the
+      // writes, and resume uses the contiguous-chunk prefix / part length which
+      // are still accurate (worst case after a crash the sender resends a few
+      // chunks the receiver re-verifies by CRC).
+      var flushDebt = (_incomingFlushDebt[fileIndex] ?? 0) + event.data.length;
+      if (flushDebt >= _kIncomingFlushThresholdBytes ||
+          next >= manifest.totalChunks) {
+        await raf.flush();
+        flushDebt = 0;
+      }
+      _incomingFlushDebt[fileIndex] = flushDebt;
       _incomingContiguousChunks[fileIndex] = next;
 
-      _pumpIncomingProgress(fileIndex, next);
+      _pumpIncomingProgress(
+        fileIndex,
+        next,
+        force: next >= manifest.totalChunks,
+      );
       await _transport.sendChunkAck(fileIndex, event.metadata.index);
     } catch (e) {
       await _transport.sendChunkError(fileIndex, event.metadata.index);
@@ -760,6 +906,7 @@ class TransferCubit extends Cubit<TransferState> {
         await raf.close();
       } catch (_) {}
     }
+    _incomingFlushDebt.remove(event.fileIndex);
 
     if (!await partFile.exists()) {
       // A duplicate marker (or crash after rename) can leave the part file
@@ -769,7 +916,7 @@ class TransferCubit extends Cubit<TransferState> {
       if (await finalFile.exists() &&
           await finalFile.length() == manifest.fileSize) {
         if (event.sha256.isNotEmpty) {
-          final existingHash = await computeFileHash(manifest.filePath);
+          final existingHash = await computeFileHashInBackground(manifest.filePath);
           if (existingHash != event.sha256) {
             await _incomingFailFile(event.fileIndex);
             return;
@@ -795,7 +942,7 @@ class TransferCubit extends Cubit<TransferState> {
       return;
     }
 
-    final actualHash = await computeFileHash(partPath);
+    final actualHash = await computeFileHashInBackground(partPath);
     if (event.sha256.isNotEmpty && actualHash != event.sha256) {
       await _incomingFailFile(event.fileIndex);
       return;
@@ -835,6 +982,7 @@ class TransferCubit extends Cubit<TransferState> {
     }
     _incomingPendingChunks.remove(fileIndex);
     _incomingContiguousChunks.remove(fileIndex);
+    _incomingFlushDebt.remove(fileIndex);
 
     final files = List<TransferFileManifest>.from(_incoming!.files);
     files[fileIndex] = files[fileIndex].copyWith(
@@ -867,25 +1015,32 @@ class TransferCubit extends Cubit<TransferState> {
       completedAt: DateTime.now(),
     );
     await _sessionRepo.saveSession(completed);
-    _notifications.showTransferMessage(
+    _notifications.showMessage(
       title: 'Transfer complete',
       body: '${completed.files.length} file(s) saved to ${_incomingSaveDir ?? ''}',
     );
+    unawaited(_foreground.stop());
     emit(state.copyWith(incomingSession: completed));
     _incoming = null;
   }
 
-  void _pumpIncomingProgress(int fileIndex, int chunksReceived) {
-    if (_incoming == null) return;
-    final files = List<TransferFileManifest>.from(_incoming!.files);
-    files[fileIndex] = files[fileIndex].copyWith(
-      status: FileTransferStatus.transferring,
-      chunksSent: chunksReceived,
-      lastAckedChunk: chunksReceived - 1,
-    );
-    _incoming = _incoming!.copyWith(files: files);
-    emit(state.copyWith(incomingSession: _incoming));
+  void _pumpIncomingProgress(int fileIndex, int chunksReceived, {bool force = false}) {
+  if (_incoming == null) return;
+  final now = DateTime.now();
+  if (!force && now.difference(_lastIncomingUiEmit) < _kUiProgressInterval) {
+    return;
   }
+  if (!force) _lastIncomingUiEmit = now;
+
+  final files = List<TransferFileManifest>.from(_incoming!.files);
+  files[fileIndex] = files[fileIndex].copyWith(
+    status: FileTransferStatus.transferring,
+    chunksSent: chunksReceived,
+    lastAckedChunk: chunksReceived - 1,
+  );
+  _incoming = _incoming!.copyWith(files: files);
+  emit(state.copyWith(incomingSession: _incoming));
+}
 
   int _nextChunkForBytes(int bytes, int totalChunks) {
     if (bytes <= 0) return 0;
@@ -917,6 +1072,8 @@ class TransferCubit extends Cubit<TransferState> {
     _incomingChunkSub?.cancel();
     _incomingFileCompleteSub?.cancel();
     _incomingSessionCompleteSub?.cancel();
+    _notifications.dispose();
+    _foreground.dispose();
     return super.close();
   }
 }

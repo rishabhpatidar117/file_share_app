@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'crc32c.dart';
@@ -212,3 +213,13 @@ Future<String> computeFileHash(String filePath) async {
   final hash = await sha256.bind(stream).first;
   return hash.toString();
 }
+
+/// Whole-file SHA-256 computed on a worker isolate so a multi-GB verification
+/// pass never stalls the Flutter UI isolate. Used at the end of every file
+/// transfer (sender computes the ref hash; the receiver verifies it).
+Future<String> computeFileHashInBackground(String filePath) {
+  final path = filePath;
+  return Isolate.run(() => _sha256FileSyncish(path));
+}
+
+Future<String> _sha256FileSyncish(String filePath) => computeFileHash(filePath);

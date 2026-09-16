@@ -127,4 +127,14 @@ void main() {
     expect(restored.crc32cChecksum, meta.crc32cChecksum);
     expect(restored.isLast, meta.isLast);
   });
+
+  test('background hash is identical to the foreground hash', () async {
+    final file = File('${tempDir.path}/bg_hash.bin');
+    file.writeAsBytesSync(makePayload(700_000));
+
+    final foreground = await computeFileHash(file.path);
+    final background = await computeFileHashInBackground(file.path);
+    expect(background, foreground);
+    expect(background.length, 64); // sha-256 hex
+  });
 }

@@ -1,3 +1,4 @@
+import '../../core/services/network_diagnostics.dart';
 import 'session/transfer_session.dart';
 
 enum TransferStatus {
@@ -26,6 +27,14 @@ class TransferState {
 
   final String? incomingError;
 
+  /// Live local-network characteristics captured when a transfer starts
+  /// (used for the network diagnostics readout; informational only).
+  final WifiLinkInfo? networkInfo;
+
+  /// Concise transport readout (actual kind + recommended kind + confidence),
+  /// e.g. "LAN • LAN (90%)". Diagnostic only.
+  final String? transportLabel;
+
   const TransferState({
     this.status = TransferStatus.idle,
     this.session,
@@ -36,6 +45,8 @@ class TransferState {
     this.incomingSession,
     this.saveDirectory,
     this.incomingError,
+    this.networkInfo,
+    this.transportLabel,
   });
 
   double get incomingProgress {
@@ -57,6 +68,8 @@ class TransferState {
     String? incomingError,
     bool clearIncoming = false,
     bool clearIncomingError = false,
+    WifiLinkInfo? networkInfo,
+    String? transportLabel,
   }) {
     return TransferState(
       status: status ?? this.status,
@@ -68,6 +81,8 @@ class TransferState {
       incomingSession: clearIncoming ? null : (incomingSession ?? this.incomingSession),
       saveDirectory: clearIncoming ? null : (saveDirectory ?? this.saveDirectory),
       incomingError: clearIncomingError ? null : (incomingError ?? this.incomingError),
+      networkInfo: networkInfo ?? this.networkInfo,
+      transportLabel: transportLabel ?? this.transportLabel,
     );
   }
 }

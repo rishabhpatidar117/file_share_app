@@ -135,6 +135,26 @@ class TransferScreen extends StatelessWidget {
                       style: AppTextStyles.bodySmall(isDark: isDark),
                     ),
                   ],
+                  if (state.networkInfo != null &&
+                      state.networkInfo!.summaryLabel.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      state.networkInfo!.summaryLabel,
+                      style: AppTextStyles.bodySmall(
+                        isDark: isDark,
+                      ).copyWith(fontSize: 11),
+                    ),
+                  ],
+                  if (state.transportLabel != null &&
+                      state.transportLabel!.isNotEmpty) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      state.transportLabel!,
+                      style: AppTextStyles.bodySmall(
+                        isDark: isDark,
+                      ).copyWith(fontSize: 10),
+                    ),
+                  ],
                   const SizedBox(height: 12),
                   Text(
                     '${ByteFormatter.format(session.transferredBytes)} / ${ByteFormatter.format(session.totalBytes)}',

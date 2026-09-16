@@ -2,6 +2,8 @@ import 'package:get_it/get_it.dart';
 import 'package:hive/hive.dart';
 import 'package:window_manager/window_manager.dart';
 import '../services/notification_service.dart';
+import '../services/transfer_notification_queue.dart';
+import '../services/network_diagnostics.dart';
 import '../services/permission_service.dart';
 import '../services/share_receiver_service.dart';
 import '../utils/device_name.dart';
@@ -12,6 +14,7 @@ import '../../features/history/history_cubit.dart';
 import '../../transport/transport_channel.dart';
 import '../../transport/transport_factory.dart';
 import '../../features/transfer/session/session_repository.dart';
+import '../../core/services/transfer_foreground_service.dart';
 
 final getIt = GetIt.instance;
 
@@ -29,6 +32,12 @@ Future<void> initServiceLocator() async {
   getIt.registerLazySingleton(() => notifications);
   await notifications.initialize();
 
+  // Transfer notifications run through a throttled, non-blocking queue so
+  // Android notification I/O can never stall the transfer engine.
+  getIt.registerLazySingleton(() => TransferNotificationQueue(notifications));
+  getIt.registerLazySingleton(() => NetworkDiagnostics());
+  getIt.registerLazySingleton(() => TransferForegroundService());
+
   getIt.registerLazySingleton(() => PermissionService(notifications));
 
   final shareReceiver = ShareReceiverService();
@@ -40,7 +49,9 @@ Future<void> initServiceLocator() async {
   transport.setDeviceName(deviceName);
 
   getIt.registerFactory(() => DiscoveryCubit(getIt()));
-  getIt.registerFactory(() => TransferCubit(getIt(), getIt(), getIt(), settingsBox));
+  getIt.registerFactory(
+    () => TransferCubit(getIt(), getIt(), getIt(), getIt(), getIt(), settingsBox),
+  );
   getIt.registerFactory(() => SettingsCubit(settingsBox, transport, defaultDeviceName: deviceName));
   getIt.registerFactory(() => HistoryCubit(getIt()));
 }

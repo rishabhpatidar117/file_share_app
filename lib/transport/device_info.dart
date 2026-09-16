@@ -1,3 +1,5 @@
+import 'transport_kind.dart';
+
 class DeviceInfo {
   final String id;
   final String name;
@@ -6,6 +8,9 @@ class DeviceInfo {
   final String? address;
   final int? port;
 
+  /// How the peer was discovered (LAN beacon vs Wi-Fi Direct peer list).
+  final TransportKind? kind;
+
   const DeviceInfo({
     required this.id,
     required this.name,
@@ -13,6 +18,7 @@ class DeviceInfo {
     this.quality = ConnectionQuality.good,
     this.address,
     this.port,
+    this.kind,
   });
 
   DeviceInfo copyWith({
@@ -22,6 +28,7 @@ class DeviceInfo {
     ConnectionQuality? quality,
     String? address,
     int? port,
+    TransportKind? kind,
   }) {
     return DeviceInfo(
       id: id ?? this.id,
@@ -30,6 +37,7 @@ class DeviceInfo {
       quality: quality ?? this.quality,
       address: address ?? this.address,
       port: port ?? this.port,
+      kind: kind ?? this.kind,
     );
   }
 }

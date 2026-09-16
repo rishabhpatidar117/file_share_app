@@ -2,13 +2,15 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show debugPrint;
 import '../transport_channel.dart';
 import '../device_info.dart';
+import '../transport_kind.dart';
 import '../../core/utils/chunker.dart';
 
 /// LAN transport: real UDP beacon discovery + framed TCP data channel.
 ///
-/// Protocol (length-prefixed JSON frames over TCP):
+/// Protocol (length-prefixed frames over TCP):
 ///   hello / hello_ack
 ///   session_start / session_ack (with resume points)
 ///   chunk / chunk_ack / chunk_error
@@ -17,9 +19,39 @@ import '../../core/utils/chunker.dart';
 ///
 /// Direction rule: the device that opens the TCP connection is the SENDER for
 /// that connection; the listening device is the RECEIVER.
+///
+/// # Frame formats
+/// Control frames are JSON objects prefixed with a 4-byte big-endian length:
+///   [uint32 len][utf8(json)]
+///
+/// Chunk payload frames are negotiated between peers during the hello
+/// handshake. When both devices speak `_protocolVersion >= 2` the sender uses
+/// a binary frame (no base64, no JSON string for the payload), which removes
+/// the ~33% base64 expansion and the per-chunk JSON encode/decode cost that
+/// dominated the old 10 MB/s transfers:
+///   [uint32 len]['SSCH'][uint32 metaLen][utf8(json meta)][raw payload]
+/// Peers that only speak v1 (legacy builds) keep the base64-in-JSON chunk
+/// encoding, so mixed-version transfers stay compatible.
 class LanSocketTransport extends TransportChannel {
   static const int servicePort = kSwiftShareServicePort;
   static const int discoveryPort = 48733;
+  static const int _protocolVersion = 2;
+
+  /// What kind of segment this instance's sockets run over. Subclasses that
+  /// extend the engine (e.g. Wi-Fi Direct) pass a different kind; the wire
+  /// protocol and transfer semantics are exactly the same.
+  final TransportKind _kind;
+
+  LanSocketTransport({TransportKind kind = TransportKind.lan}) : _kind = kind;
+
+  @override
+  TransportKind get transportKind => _kind;
+
+  /// Byte magic that marks a v2 binary chunk frame.
+  static const int _binaryChunkMagic0 = 0x53; // 'S'
+  static const int _binaryChunkMagic1 = 0x53; // 'S'
+  static const int _binaryChunkMagic2 = 0x43; // 'C'
+  static const int _binaryChunkMagic3 = 0x48; // 'H'
 
   /// Android emulator alias for the host machine's loopback interface.
   /// Broadcasts stay inside the emulator's NAT, so also unicast beacons here
@@ -38,14 +70,22 @@ class LanSocketTransport extends TransportChannel {
   final Set<Socket> _peerSockets = {};
   final Map<Socket, String> _peerNames = {};
   final Set<Socket> _pendingConnections = {};
+
+  /// Protocol version each peer reports during the hello handshake.
+  final Map<Socket, int> _peerVersions = {};
+
+  /// Per-socket receive buffers (each socket owns its own, so parallel peers
+  /// can never interleave frames).
+  final Map<Socket, _FrameAccumulator> _receivers = {};
+
+  /// Per-socket coalescing writers (batch queued frames into big writes).
+  final Map<Socket, _FrameWriter> _writers = {};
+
   Timer? _beaconTimer;
   Timer? _scanTimeout;
   String _deviceName = 'My Device';
   final String _instanceId = DateTime.now().microsecondsSinceEpoch.toRadixString(16);
 
-  // Message framing buffer.
-  final List<int> _receiveBuffer = [];
-  final Map<Socket, Future<void>> _writeChains = {};
   bool _listening = false;
   bool _discovering = false;
 
@@ -98,6 +138,7 @@ class LanSocketTransport extends TransportChannel {
         quality: ConnectionQuality.good,
         address: senderAddr,
         port: (map['port'] as int?) ?? servicePort,
+        kind: TransportKind.fromName(map['kind'] as String?),
       );
       final existing = _discoveredDevices.indexWhere((d) => d.id == device.id);
       if (existing >= 0) {
@@ -116,6 +157,7 @@ class LanSocketTransport extends TransportChannel {
       'id': _instanceId,
       'name': _deviceName,
       'platform': _platformString,
+      'kind': _kind.name,
       'port': servicePort,
     }));
     try {
@@ -227,6 +269,8 @@ class LanSocketTransport extends TransportChannel {
         'type': 'hello',
         'name': _deviceName,
         'platform': _platformString,
+        'kind': _kind.name,
+        'ver': _protocolVersion,
       });
     } catch (e) {
       updateState(TransportState.error);
@@ -256,8 +300,10 @@ class LanSocketTransport extends TransportChannel {
   void _removePeer(Socket socket) {
     final wasPeer = _peerSockets.remove(socket);
     _peerNames.remove(socket);
+    _peerVersions.remove(socket);
     _pendingConnections.remove(socket);
-    _writeChains.remove(socket);
+    _receivers.remove(socket);
+    _writers.remove(socket);
     if (identical(socket, _connectedSocket)) _connectedSocket = null;
     if (identical(socket, _incomingSocket)) _incomingSocket = null;
     if (!wasPeer) return;
@@ -317,14 +363,18 @@ class LanSocketTransport extends TransportChannel {
       'type': 'hello_ack',
       'name': _deviceName,
       'platform': _platformString,
+      'kind': _kind.name,
+      'ver': _protocolVersion,
     });
   }
 
   void _setupDataListener(Socket socket) {
+    if (_receivers.containsKey(socket)) return;
+    final accumulator = _FrameAccumulator();
+    _receivers[socket] = accumulator;
     socket.listen(
       (data) {
-        _receiveBuffer.addAll(data);
-        _processBuffer(socket);
+        accumulator.add(data, (frame) => _handleFrame(socket, frame));
       },
       onError: (_) => _handleSocketClosed(socket),
       onDone: () => _handleSocketClosed(socket),
@@ -332,6 +382,7 @@ class LanSocketTransport extends TransportChannel {
   }
 
   void _handleSocketClosed(Socket socket) {
+    _receivers.remove(socket);
     final wasPeer = _peerSockets.contains(socket);
     if (identical(socket, _connectedSocket) && !wasPeer) {
       // Connection dropped before the hello/hello_ack handshake completed.
@@ -346,42 +397,52 @@ class LanSocketTransport extends TransportChannel {
   // Framing + message dispatch
   // ---------------------------------------------------------------------------
 
-  void _processBuffer(Socket socket) {
-    while (_receiveBuffer.length >= 4) {
-      final length = ByteData.sublistView(Uint8List.fromList(_receiveBuffer))
-          .getUint32(0);
-      if (length > 64 * 1024 * 1024) {
-        _receiveBuffer.clear();
-        return;
-      }
-      if (_receiveBuffer.length < 4 + length) break;
-
-      final messageBytes = _receiveBuffer.sublist(4, 4 + length);
-      _receiveBuffer.removeRange(0, 4 + length);
-
+  /// Handles one complete frame body. Binary v2 chunk frames are recognised by
+  /// their 'SSCH' magic; everything else is treated as legacy JSON.
+  void _handleFrame(Socket socket, Uint8List frame) {
+    if (frame.length >= 8 &&
+        frame[0] == _binaryChunkMagic0 &&
+        frame[1] == _binaryChunkMagic1 &&
+        frame[2] == _binaryChunkMagic2 &&
+        frame[3] == _binaryChunkMagic3) {
+      final metaLen = ByteData.sublistView(frame, 4).getUint32(0);
+      if (metaLen > frame.length - 8) return; // malformed; drop
       try {
-        final message = jsonDecode(utf8.decode(messageBytes));
-        if (message is Map<String, dynamic>) {
-          _handleMessage(socket, message);
+        final meta = jsonDecode(utf8.decode(frame.sublist(8, 8 + metaLen)));
+        if (meta is Map<String, dynamic>) {
+          final payload = Uint8List.sublistView(frame, 8 + metaLen);
+          _handleMessage(socket, meta, chunkPayload: payload);
         }
       } catch (_) {}
+      return;
     }
+    try {
+      final message = jsonDecode(utf8.decode(frame));
+      if (message is Map<String, dynamic>) {
+        _handleMessage(socket, message);
+      }
+    } catch (_) {}
   }
 
-  void _handleMessage(Socket socket, Map<String, dynamic> message) {
+  void _handleMessage(Socket socket, Map<String, dynamic> message,
+      {Uint8List? chunkPayload}) {
     final type = message['type'];
 
     switch (type) {
       case 'hello':
+        _peerVersions[socket] = (message['ver'] as int?) ?? 1;
         _establishPeer(socket, message['name'] as String? ?? 'Unknown');
         _sendMessage(socket, {
           'type': 'hello_ack',
           'name': _deviceName,
           'platform': _platformString,
+          'kind': _kind.name,
+          'ver': _protocolVersion,
         });
         break;
 
       case 'hello_ack':
+        _peerVersions[socket] = (message['ver'] as int?) ?? 1;
         _establishPeer(socket, message['name'] as String? ?? 'Unknown');
         break;
 
@@ -418,7 +479,7 @@ class LanSocketTransport extends TransportChannel {
       case 'chunk':
         final fileIndex = message['fileIndex'] as int;
         final metadata = ChunkMetadata.fromJson(message['metadata']);
-        final data = base64Decode(message['data']);
+        final data = chunkPayload ?? base64Decode(message['data'] as String);
         chunkReceivedController.add(ChunkReceivedEvent(
           fileIndex: fileIndex,
           metadata: metadata,
@@ -469,23 +530,38 @@ class LanSocketTransport extends TransportChannel {
 
   String _chunkKey(int fileIndex, int chunkIndex) => '$fileIndex:$chunkIndex';
 
+  /// Serializes a JSON control frame onto the socket's coalescing writer.
   Future<void> _sendMessage(Socket socket, Map<String, dynamic> message) async {
     final bytes = utf8.encode(json.encode(message));
     final frame = Uint8List(4 + bytes.length);
     ByteData.sublistView(frame).setUint32(0, bytes.length);
     frame.setRange(4, frame.length, bytes);
+    await _writerFor(socket).write(frame);
+  }
 
-    // dart:io sockets only allow one un-flushed add() at a time
-    // (io_sink's flush() binds the sink), so serialize writes per socket.
-    final previous = _writeChains[socket] ?? Future<void>.value();
-    final next = previous
-        .catchError((_) {})
-        .then((_) async {
-          socket.add(frame);
-          await socket.flush();
-        });
-    _writeChains[socket] = next;
-    return next;
+  _FrameWriter _writerFor(Socket socket) =>
+      _writers[socket] ??= _FrameWriter(socket);
+
+  /// Builds a v2 binary chunk frame:
+  ///   [uint32 len]['SSCH'][uint32 metaLen][utf8(json meta)][raw payload]
+  Uint8List _encodeBinaryChunkFrame(
+      int fileIndex, ChunkMetadata metadata, Uint8List data) {
+    final meta = utf8.encode(json.encode({
+      'type': 'chunk',
+      'fileIndex': fileIndex,
+      'metadata': metadata.toJson(),
+    }));
+    final bodyLen = 4 + 4 + meta.length + data.length;
+    final frame = Uint8List(4 + bodyLen);
+    ByteData.sublistView(frame).setUint32(0, bodyLen);
+    frame[4] = _binaryChunkMagic0;
+    frame[5] = _binaryChunkMagic1;
+    frame[6] = _binaryChunkMagic2;
+    frame[7] = _binaryChunkMagic3;
+    ByteData.sublistView(frame, 8).setUint32(0, meta.length);
+    frame.setRange(12, 12 + meta.length, meta);
+    frame.setRange(12 + meta.length, frame.length, data);
+    return frame;
   }
 
   // ---------------------------------------------------------------------------
@@ -509,6 +585,10 @@ class LanSocketTransport extends TransportChannel {
     int? chunkSize,
   }) async {
     final socket = _senderSocket;
+    debugPrint(
+      '[TRANSFER] session=$sessionId remote=${socket.remoteAddress.address} '
+      'files=${files.length} ver=${_peerVersions[socket] ?? 1}',
+    );
     final completer = Completer<ResumePoints>();
     _sessionStartWaiter = completer;
     await _sendMessage(socket, {
@@ -532,12 +612,18 @@ class LanSocketTransport extends TransportChannel {
     final key = _chunkKey(fileIndex, metadata.index);
     final completer = Completer<void>();
     _chunkAckWaiters[key] = completer;
-    await _sendMessage(socket, {
-      'type': 'chunk',
-      'fileIndex': fileIndex,
-      'metadata': metadata.toJson(),
-      'data': base64Encode(data),
-    });
+
+    if ((_peerVersions[socket] ?? 1) >= _protocolVersion) {
+      final frame = _encodeBinaryChunkFrame(fileIndex, metadata, data);
+      await _writerFor(socket).write(frame);
+    } else {
+      await _sendMessage(socket, {
+        'type': 'chunk',
+        'fileIndex': fileIndex,
+        'metadata': metadata.toJson(),
+        'data': base64Encode(data),
+      });
+    }
     await completer.future.timeout(
       const Duration(seconds: 30),
       onTimeout: () {
@@ -556,6 +642,10 @@ class LanSocketTransport extends TransportChannel {
     int totalChunks = 0,
   }) async {
     final socket = _senderSocket;
+    debugPrint(
+      '[TRANSFER] file_complete file=$fileIndex size=$fileSize '
+      'chunks=$totalChunks',
+    );
     final completer = Completer<void>();
     _fileAckWaiters[fileIndex] = completer;
     await _sendMessage(socket, {
@@ -566,17 +656,13 @@ class LanSocketTransport extends TransportChannel {
       'size': fileSize,
       'totalChunks': totalChunks,
     });
-    try {
-      await completer.future.timeout(
-        const Duration(seconds: 180),
-        onTimeout: () {
-          _fileAckWaiters.remove(fileIndex);
-          throw TransportException('File $fileIndex completion timed out');
-        },
-      );
-    } finally {
-      _fileAckWaiters.remove(fileIndex);
-    }
+    await completer.future.timeout(
+      const Duration(seconds: 180),
+      onTimeout: () {
+        _fileAckWaiters.remove(fileIndex);
+        throw TransportException('File $fileIndex completion timed out');
+      },
+    );
   }
 
   @override
@@ -694,11 +780,13 @@ class LanSocketTransport extends TransportChannel {
     _pendingConnections.clear();
     _peerSockets.clear();
     _peerNames.clear();
+    _peerVersions.clear();
+    _receivers.clear();
+    _writers.clear();
     _incomingSocket = null;
     _activeIncomingSessionId = null;
     await stopIncoming();
     await stopDiscovery();
-    _receiveBuffer.clear();
     _chunkAckWaiters.clear();
     _fileAckWaiters.clear();
     updateState(TransportState.disconnected);
@@ -710,4 +798,137 @@ class LanSocketTransport extends TransportChannel {
     disconnect();
     super.dispose();
   }
+}
+
+/// Accumulates bytes for one socket and yields complete length-prefixed frames.
+/// Uses a growable buffer with a read cursor; the cursor is periodically
+/// compacted so long transfers never grow the buffer unboundedly.
+class _FrameAccumulator {
+  static const int _maxFrameLength = 64 * 1024 * 1024;
+
+  final List<int> _buffer = [];
+  int _read = 0;
+  int? _frameLength;
+
+  void add(Uint8List data, void Function(Uint8List frame) onFrame) {
+    _buffer.addAll(data);
+    _drain(onFrame);
+  }
+
+  void _drain(void Function(Uint8List frame) onFrame) {
+    while (true) {
+      final frame = _takeFrame();
+      if (frame == null) break;
+      onFrame(frame);
+    }
+    // Compact when fully consumed or past a large threshold to keep _buffer
+    // bounded and sublist copies cheap.
+    if (_read > 0 && (_read == _buffer.length || _read > 65536)) {
+      _buffer.removeRange(0, _read);
+      _read = 0;
+    }
+  }
+
+  Uint8List? _takeFrame() {
+    if (_frameLength == null) {
+      if (_buffer.length - _read < 4) return null;
+      final b = _buffer;
+      final i = _read;
+      _frameLength = ((b[i] & 0xFF) << 24) |
+          ((b[i + 1] & 0xFF) << 16) |
+          ((b[i + 2] & 0xFF) << 8) |
+          (b[i + 3] & 0xFF);
+      _read += 4;
+      if (_frameLength! > _maxFrameLength || _frameLength! < 0) {
+        // Malformed stream; reset to resync.
+        _frameLength = null;
+        _read = _buffer.length;
+        return null;
+      }
+    }
+    final available = _buffer.length - _read;
+    if (available < _frameLength!) return null;
+    final frame = Uint8List.fromList(_buffer.sublist(_read, _read + _frameLength!));
+    _read += _frameLength!;
+    _frameLength = null;
+    return frame;
+  }
+}
+
+/// Coalescing per-socket writer. dart:io sockets only allow one in-flight
+/// add()/flush() at a time, so queued frames are concatenated into a single
+/// add()+flush() per flush cycle. This turns thousands of tiny writes into a
+/// small number of bulk writes, and lets the acked sliding-window feed frames
+/// in batches instead of one flush per chunk.
+class _FrameWriter {
+  final Socket _socket;
+
+  final List<_FrameJob> _queue = [];
+  bool _pumping = false;
+
+  _FrameWriter(this._socket);
+
+  Future<void> write(Uint8List frame) {
+    final completer = Completer<void>();
+    _queue.add(_FrameJob(frame, completer));
+    _pump();
+    return completer.future;
+  }
+
+  void _pump() {
+    if (_pumping) return;
+    if (_queue.isEmpty) return;
+    // Copy, then clear: `jobs` must be independent of `_queue` so new frames
+    // queued while the flush is in flight are picked up by the next pump.
+    final jobs = List<_FrameJob>.from(_queue);
+    _queue.clear();
+    _pumping = true;
+
+    var total = 0;
+    for (final job in jobs) {
+      total += job.frame.length;
+    }
+    final batch = Uint8List(total);
+    var offset = 0;
+    for (final job in jobs) {
+      batch.setRange(offset, offset + job.frame.length, job.frame);
+      offset += job.frame.length;
+    }
+
+    try {
+      _socket.add(batch);
+      _socket.flush().then(
+        (_) => _completeJobs(jobs),
+        onError: (Object e) => _failJobs(jobs, e),
+      ).whenComplete(() {
+        _pumping = false;
+        if (_queue.isNotEmpty) _pump();
+      });
+    } catch (e) {
+      _pumping = false;
+      _failJobs(jobs, e);
+      if (_queue.isNotEmpty) _pump();
+    }
+  }
+
+  void _completeJobs(List<_FrameJob> jobs) {
+    for (final job in jobs) {
+      if (!job.completer.isCompleted) job.completer.complete();
+    }
+  }
+
+  void _failJobs(List<_FrameJob> jobs, Object error) {
+    for (final job in jobs) {
+      if (!job.completer.isCompleted) {
+        job.completer.completeError(TransportException('Socket write failed', error));
+      }
+    }
+  }
+}
+
+class _FrameJob {
+  final Uint8List frame;
+  final Completer<void> completer;
+
+  _FrameJob(this.frame, this.completer);
 }

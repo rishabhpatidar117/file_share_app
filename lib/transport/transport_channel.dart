@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'device_info.dart';
+import 'transport_kind.dart';
 import '../core/utils/chunker.dart';
 
 /// Default TCP service port shared across LAN transports.
@@ -162,6 +163,11 @@ abstract class TransportChannel {
 
   /// Configures the device name announced during discovery.
   void setDeviceName(String name) {}
+
+  /// The transport class this implementation uses to put the peers on a shared
+  /// network segment. Transfer semantics (chunking, retry, resume, CRC,
+  /// scheduling) are identical across every kind; only the link is different.
+  TransportKind get transportKind => TransportKind.lan;
 
   // ---- Sender (outgoing) side ----
 
